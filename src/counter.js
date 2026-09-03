@@ -290,7 +290,7 @@ export function setupApp(element) {
             </div>
 
             <div class="brand-text">
-              <h2>Ganpati</h2>
+              <h2>नवयुवक गणेश मंडळ 🙏</h2>
               <span>Accounts Book</span>
             </div>
 
@@ -376,7 +376,7 @@ export function setupApp(element) {
             </div>
 
             <div class="sidebar-footer">
-              🙏 गणपती बाप्पा मोरया 🙏
+              Develop by Chetan Bhoge
             </div>
 
           </div>
