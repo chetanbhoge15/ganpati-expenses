@@ -5,13 +5,22 @@
 
 export function setupApp(element) {
 
+  const authKey = "ganpati_auth";
+  let isUnlocked = sessionStorage.getItem("ganpati_unlocked") === "true";
+
   // ===================================================
   // STATE
   // ===================================================
 
+  const currentYear = new Date().getFullYear();
+  const availableYears = Array.from(
+    { length: 10 },
+    (_, index) => String(currentYear + index)
+  );
   let selectedYear =
-    localStorage.getItem("ganpati_selected_year") ||
-    String(new Date().getFullYear());
+    availableYears.includes(localStorage.getItem("ganpati_selected_year"))
+      ? localStorage.getItem("ganpati_selected_year")
+      : availableYears[0];
 
   let currentPage = "home";
 
@@ -86,6 +95,239 @@ export function setupApp(element) {
       .replaceAll(">", "&gt;")
       .replaceAll('"', "&quot;")
       .replaceAll("'", "&#039;");
+  }
+
+  async function readResponse(response) {
+    const text = await response.text();
+
+    try {
+      return text ? JSON.parse(text) : {};
+    } catch {
+      return null;
+    }
+  }
+
+  function hashValue(value) {
+    let hash = 2166136261;
+
+    for (const character of value) {
+      hash ^= character.charCodeAt(0);
+      hash = Math.imul(hash, 16777619);
+    }
+
+    return (hash >>> 0).toString(16);
+  }
+
+  function authScreen() {
+    const savedAuth = localStorage.getItem(authKey);
+    let account = null;
+
+    try {
+      account = savedAuth ? JSON.parse(savedAuth) : null;
+    } catch {
+      account = null;
+    }
+
+    const hasAccount = Boolean(account?.loginId && account?.passwordHash);
+    const savedLoginId = account?.loginId || "";
+    const savedEmail = account?.email || "";
+
+    return authFormScreen(hasAccount, savedLoginId, savedEmail);
+  }
+
+  function authFormScreen(hasAccount, savedLoginId = "", savedEmail = "", mode = hasAccount ? "login" : "create") {
+    const isResetRequest = mode === "reset-request";
+    const isResetVerify = mode === "reset-verify";
+    const isCreate = mode === "create";
+
+    return `
+      <main class="auth-screen">
+        <section class="auth-card">
+          <div class="auth-mark">ॐ</div>
+          <span class="section-tag">GANPATI MANDAL ACCOUNTS</span>
+          <h1>${isResetRequest || isResetVerify ? "Reset password" : isCreate ? "Create your login" : "Welcome back"}</h1>
+          <p>
+            ${isResetRequest
+              ? "We will send a one-time password to your registered email."
+              : isResetVerify
+                ? "Enter the one-time password sent to your email."
+              : isCreate
+                ? "Create a login ID and password for this browser."
+                : "Sign in to view the expense records."}
+          </p>
+          <form id="authForm" class="auth-form" data-auth-mode="${mode}">
+            <label>
+              <span>Login ID</span>
+              <input id="authLoginId" type="text" minlength="3" maxlength="30" value="${isCreate ? "" : escapeHTML(savedLoginId)}" autocomplete="username" ${isResetVerify ? "readonly" : ""} required />
+            </label>
+            ${isCreate || isResetRequest || mode === "login" ? `
+              <label>
+                <span>Email address</span>
+                <input id="authEmail" type="email" value="${isCreate ? "" : escapeHTML(savedEmail)}" autocomplete="email" required />
+              </label>
+            ` : ""}
+            ${isResetVerify ? `
+              <label>
+                <span>One-time password</span>
+                <input id="authOtp" type="text" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" autocomplete="one-time-code" required />
+              </label>
+            ` : ""}
+            ${!isResetRequest ? `
+              <label>
+                <span>${isCreate ? "Create password" : isResetVerify ? "New password" : "Password"}</span>
+                <input id="authPassword" type="password" minlength="6" maxlength="64" autocomplete="${isCreate || isResetVerify ? "new-password" : "current-password"}" required />
+              </label>
+            ` : ""}
+            ${isCreate || isResetVerify ? `
+              <label>
+                <span>Confirm password</span>
+                <input id="authConfirmPassword" type="password" minlength="6" maxlength="64" autocomplete="new-password" required />
+              </label>
+            ` : ""}
+            <p id="authError" class="auth-error" role="alert"></p>
+            <button type="submit" class="save-btn">${isResetRequest ? "Send OTP" : isResetVerify ? "Reset password" : isCreate ? "Create account" : "Log in"}</button>
+          </form>
+          <div class="auth-links">
+            ${hasAccount && !isCreate && !isResetRequest && !isResetVerify ? `
+              <button type="button" class="auth-link" data-auth-mode="reset-request">Forgot password?</button>
+              <button type="button" class="auth-link" data-auth-mode="create">Create new account</button>
+            ` : `
+              <button type="button" class="auth-link" data-auth-mode="login">Back to login</button>
+            `}
+          </div>
+          <small class="auth-note">${isCreate ? "Your email is used only for password recovery." : "This protects access on this browser. OTPs expire after 10 minutes."}</small>
+        </section>
+      </main>
+    `;
+  }
+
+  function setupAuth() {
+    const form = document.querySelector("#authForm");
+    if (!form) return;
+
+    document.querySelectorAll("button[data-auth-mode]").forEach(button => {
+      button.addEventListener("click", () => {
+        const savedAuth = localStorage.getItem(authKey);
+        let account = null;
+
+        try {
+          account = savedAuth ? JSON.parse(savedAuth) : null;
+        } catch {
+          account = null;
+        }
+
+        element.innerHTML = authFormScreen(Boolean(account?.loginId && account?.passwordHash), account?.loginId || "", account?.email || "", button.dataset.authMode);
+        setupAuth();
+      });
+    });
+
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+
+      const loginId = document.querySelector("#authLoginId").value.trim();
+      const email = document.querySelector("#authEmail")?.value.trim().toLowerCase();
+      const password = document.querySelector("#authPassword")?.value || "";
+      const confirmPassword = document.querySelector("#authConfirmPassword");
+      const otp = document.querySelector("#authOtp")?.value.trim();
+      const error = document.querySelector("#authError");
+      const savedAuth = localStorage.getItem(authKey);
+      let account = null;
+      const mode = form.dataset.authMode;
+
+      if (savedAuth) {
+        try {
+          account = JSON.parse(savedAuth);
+        } catch {
+          account = null;
+        }
+      }
+
+      if (!loginId || loginId.length < 3) {
+        error.textContent = "Login ID must be at least 3 characters.";
+        return;
+      }
+
+      if ((mode === "create" || mode === "reset-verify") && confirmPassword && password !== confirmPassword.value) {
+        error.textContent = "Passwords do not match.";
+        return;
+      }
+
+      if (mode === "reset-request") {
+        if (!account || account.loginId !== loginId || account.email !== email) {
+          error.textContent = "Login ID and registered email do not match.";
+          return;
+        }
+
+        try {
+          const response = await fetch("/api/send-otp", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ loginId, email })
+          });
+          const result = await readResponse(response);
+          if (!response.ok || !result) throw new Error(result?.error || "OTP service is unavailable. Deploy the API and configure its environment variables.");
+          element.innerHTML = authFormScreen(true, loginId, email, "reset-verify");
+          setupAuth();
+        } catch (requestError) {
+          error.textContent = requestError.message;
+        }
+        return;
+      }
+
+      if (savedAuth && mode !== "create") {
+        if (mode === "login" && (!account || account.loginId !== loginId || account.passwordHash !== hashValue(password))) {
+          error.textContent = "Incorrect login ID or password.";
+          return;
+        }
+
+        if (mode === "login" && account.email && account.email !== email) {
+          error.textContent = "Incorrect login ID or password.";
+          return;
+        }
+
+        if (mode === "login" && !account.email) {
+          account.email = email;
+          localStorage.setItem(authKey, JSON.stringify(account));
+        }
+      }
+
+      if (mode === "reset-verify") {
+        if (!/^\d{6}$/.test(otp)) {
+          error.textContent = "Enter the 6-digit OTP.";
+          return;
+        }
+
+        try {
+          const response = await fetch("/api/verify-otp", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ loginId, email: account.email, otp })
+          });
+          const result = await readResponse(response);
+          if (!response.ok || !result) throw new Error(result?.error || "OTP service is unavailable. Deploy the API and configure its environment variables.");
+        } catch (requestError) {
+          error.textContent = requestError.message;
+          return;
+        }
+      }
+
+      if (mode === "create" || mode === "reset-verify") {
+        const nextAccount = {
+          loginId,
+          email: mode === "create" ? email : account.email,
+          passwordHash: hashValue(password)
+        };
+
+        if (mode === "create") {
+          localStorage.setItem(authKey, JSON.stringify(nextAccount));
+        }
+        localStorage.setItem(authKey, JSON.stringify(nextAccount));
+      }
+
+      sessionStorage.setItem("ganpati_unlocked", "true");
+      isUnlocked = true;
+      render("home");
+    });
   }
 
   function today() {
@@ -375,6 +617,15 @@ export function setupApp(element) {
 
             </div>
 
+            <button
+              id="logoutApp"
+              class="logout-sidebar-btn"
+              type="button"
+              title="Logout"
+            >
+              🚪 Logout
+            </button>
+
             <div class="sidebar-footer">
               Develop by Chetan Bhoge
             </div>
@@ -409,9 +660,13 @@ export function setupApp(element) {
                   Accounting Year
                 </small>
 
-                <strong>
-                  ${selectedYear}
-                </strong>
+                <select id="yearSelector" aria-label="Accounting Year">
+                  ${availableYears.map(year => `
+                    <option value="${year}" ${year === selectedYear ? "selected" : ""}>
+                      ${year}
+                    </option>
+                  `).join("")}
+                </select>
 
               </div>
 
@@ -471,6 +726,12 @@ export function setupApp(element) {
   // ===================================================
 
   function render(page = "home") {
+
+    if (!isUnlocked) {
+      element.innerHTML = authScreen();
+      setupAuth();
+      return;
+    }
 
     currentPage = page;
 
@@ -556,6 +817,26 @@ export function setupApp(element) {
         );
 
       });
+
+    const logoutButton = document.querySelector("#logoutApp");
+
+    const yearSelector = document.querySelector("#yearSelector");
+
+    if (yearSelector) {
+      yearSelector.addEventListener("change", event => {
+        selectedYear = event.target.value;
+        localStorage.setItem("ganpati_selected_year", selectedYear);
+        render(currentPage);
+      });
+    }
+
+    if (logoutButton) {
+      logoutButton.addEventListener("click", () => {
+        sessionStorage.removeItem("ganpati_unlocked");
+        isUnlocked = false;
+        render();
+      });
+    }
   }
 
   // ===================================================
