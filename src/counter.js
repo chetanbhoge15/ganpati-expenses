@@ -71,6 +71,70 @@ export function setupApp(element) {
       key(type),
       JSON.stringify(data)
     );
+
+    void saveCloudData(type, data);
+  }
+
+  const cloudTypes = ["boys", "main", "family", "visarjan", "expenses"];
+
+  function getLocalAccount() {
+    try {
+      return JSON.parse(localStorage.getItem(authKey) || "null");
+    } catch {
+      return null;
+    }
+  }
+
+  async function cloudRequest(body) {
+    const response = await fetch("/api/data", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    const result = await readResponse(response);
+    if (!response.ok || !result) throw new Error(result?.error || "Shared data service is unavailable.");
+    return result;
+  }
+
+  async function saveCloudData(type, data) {
+    const account = getLocalAccount();
+    if (!account?.loginId || !account?.passwordHash) return;
+
+    try {
+      await cloudRequest({
+        action: "save",
+        loginId: account.loginId,
+        passwordHash: account.passwordHash,
+        year: selectedYear,
+        type,
+        data
+      });
+    } catch {
+      // Local storage remains available when the shared service is offline.
+    }
+  }
+
+  async function syncCloudData(account) {
+    if (!account?.loginId || !account?.passwordHash) return;
+
+    for (const type of cloudTypes) {
+      try {
+        const result = await cloudRequest({
+          action: "get",
+          loginId: account.loginId,
+          passwordHash: account.passwordHash,
+          year: selectedYear,
+          type
+        });
+        const localData = getData(type);
+        const remoteData = Array.isArray(result.data) ? result.data : [];
+        const merged = [...remoteData, ...localData.filter(localItem => !remoteData.some(remoteItem => String(remoteItem.id) === String(localItem.id)))];
+        localStorage.setItem(key(type), JSON.stringify(merged));
+        if (merged.length !== remoteData.length) await saveCloudData(type, merged);
+      } catch {
+        // Keep cached records usable if synchronization is unavailable.
+      }
+    }
   }
 
   // ===================================================
@@ -191,6 +255,8 @@ export function setupApp(element) {
             ${hasAccount && !isCreate && !isResetRequest && !isResetVerify ? `
               <button type="button" class="auth-link" data-auth-mode="reset-request">Forgot password?</button>
               <button type="button" class="auth-link" data-auth-mode="create">Create new account</button>
+            ` : !hasAccount && isCreate ? `
+              <button type="button" class="auth-link" data-auth-mode="login">Already have an account? Log in</button>
             ` : `
               <button type="button" class="auth-link" data-auth-mode="login">Back to login</button>
             `}
@@ -289,6 +355,18 @@ export function setupApp(element) {
           account.email = email;
           localStorage.setItem(authKey, JSON.stringify(account));
         }
+
+        if (mode === "login") {
+          try {
+            await fetch("/api/account", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ action: "create", ...account })
+            });
+          } catch {
+            // Existing local accounts can still log in while the service is offline.
+          }
+        }
       }
 
       if (mode === "reset-verify") {
@@ -311,6 +389,23 @@ export function setupApp(element) {
         }
       }
 
+      if (mode === "login" && !account) {
+        try {
+          const response = await fetch("/api/account", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "login", loginId, email, passwordHash: hashValue(password) })
+          });
+          const result = await readResponse(response);
+          if (!response.ok || !result?.account) throw new Error(result?.error || "Incorrect login ID, email, or password.");
+          account = result.account;
+          localStorage.setItem(authKey, JSON.stringify(account));
+        } catch (requestError) {
+          error.textContent = requestError.message;
+          return;
+        }
+      }
+
       if (mode === "create" || mode === "reset-verify") {
         const nextAccount = {
           loginId,
@@ -319,6 +414,18 @@ export function setupApp(element) {
         };
 
         if (mode === "create") {
+          try {
+            const response = await fetch("/api/account", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ action: "create", ...nextAccount })
+            });
+            const result = await readResponse(response);
+            if (!response.ok || !result?.account) throw new Error(result?.error || "Unable to create shared account.");
+          } catch (requestError) {
+            error.textContent = requestError.message;
+            return;
+          }
           localStorage.setItem(authKey, JSON.stringify(nextAccount));
         }
         localStorage.setItem(authKey, JSON.stringify(nextAccount));
@@ -326,6 +433,7 @@ export function setupApp(element) {
 
       sessionStorage.setItem("ganpati_unlocked", "true");
       isUnlocked = true;
+      await syncCloudData(getLocalAccount());
       render("home");
     });
   }
