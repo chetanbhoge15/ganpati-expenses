@@ -1,26 +1,19 @@
 // =====================================================
-// GANPATI MANDAL ACCOUNTS
-// FULL UPDATED counter.js
+// GANPATI MANDAL ACCOUNTS + SUPABASE AUTH
 // =====================================================
 
-export function setupApp(element) {
+import { supabase, supabaseConfigured } from "./supabase.js";
 
-  const authKey = "ganpati_auth";
-  let isUnlocked = sessionStorage.getItem("ganpati_unlocked") === "true";
-
+async function startApp(element) {
   // ===================================================
   // STATE
   // ===================================================
 
-  const currentYear = new Date().getFullYear();
-  const availableYears = Array.from(
-    { length: 10 },
-    (_, index) => String(currentYear + index)
-  );
   let selectedYear =
-    availableYears.includes(localStorage.getItem("ganpati_selected_year"))
-      ? localStorage.getItem("ganpati_selected_year")
-      : availableYears[0];
+    localStorage.getItem("ganpati_selected_year") ||
+    String(new Date().getFullYear());
+
+  let cloudReady = supabaseConfigured;
 
   let currentPage = "home";
 
@@ -58,84 +51,111 @@ export function setupApp(element) {
 
   function getData(type) {
     try {
-      return JSON.parse(
-        localStorage.getItem(key(type))
-      ) || [];
+      return JSON.parse(localStorage.getItem(key(type))) || [];
     } catch {
       return [];
     }
   }
 
-  function saveData(type, data) {
-    localStorage.setItem(
-      key(type),
-      JSON.stringify(data)
-    );
+  // ===================================================
+// LOCAL + SUPABASE CLOUD STORAGE
+// ===================================================
 
-    void saveCloudData(type, data);
-  }
+async function syncYearToCloud() {
+  if (!cloudReady) return;
 
-  const cloudTypes = ["boys", "main", "family", "visarjan", "expenses"];
+  try {
+    const {
+      data: { user }
+    } = await supabase.auth.getUser();
 
-  function getLocalAccount() {
-    try {
-      return JSON.parse(localStorage.getItem(authKey) || "null");
-    } catch {
-      return null;
+    if (!user) return;
+
+    const payload = {
+      boys: getData("boys"),
+      main: getData("main"),
+      family: getData("family"),
+      visarjan: getData("visarjan"),
+      expenses: getData("expenses")
+    };
+
+    const { error } = await supabase
+      .from("ganpati_year_data")
+      .upsert(
+        {
+          user_id: user.id,
+          year: Number(selectedYear),
+          data: payload,
+          updated_at: new Date().toISOString()
+        },
+        {
+          onConflict: "user_id,year"
+        }
+      );
+
+    if (error) {
+      console.error("Cloud sync error:", error);
     }
+  } catch (error) {
+    console.error("Cloud sync failed:", error);
   }
+}
 
-  async function cloudRequest(body) {
-    const response = await fetch("/api/data", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    });
-    const result = await readResponse(response);
-    if (!response.ok || !result) throw new Error(result?.error || "Shared data service is unavailable.");
-    return result;
-  }
+async function loadYearFromCloud() {
+  if (!cloudReady) return;
 
-  async function saveCloudData(type, data) {
-    const account = getLocalAccount();
-    if (!account?.loginId || !account?.passwordHash) return;
+  try {
+    const {
+      data: { user }
+    } = await supabase.auth.getUser();
 
-    try {
-      await cloudRequest({
-        action: "save",
-        loginId: account.loginId,
-        passwordHash: account.passwordHash,
-        year: selectedYear,
-        type,
-        data
-      });
-    } catch {
-      // Local storage remains available when the shared service is offline.
+    if (!user) return;
+
+    const { data, error } = await supabase
+      .from("ganpati_year_data")
+      .select("data")
+      .eq("user_id", user.id)
+      .eq("year", Number(selectedYear))
+      .maybeSingle();
+
+    if (error) {
+      console.error("Cloud load error:", error);
+      return;
     }
-  }
 
-  async function syncCloudData(account) {
-    if (!account?.loginId || !account?.passwordHash) return;
+    if (data?.data) {
+      const cloudData = data.data;
 
-    for (const type of cloudTypes) {
-      try {
-        const result = await cloudRequest({
-          action: "get",
-          loginId: account.loginId,
-          passwordHash: account.passwordHash,
-          year: selectedYear,
-          type
+      ["boys", "main", "family", "visarjan", "expenses"]
+        .forEach((type) => {
+          localStorage.setItem(
+            key(type),
+            JSON.stringify(cloudData[type] || [])
+          );
         });
-        const localData = getData(type);
-        const remoteData = Array.isArray(result.data) ? result.data : [];
-        const merged = [...remoteData, ...localData.filter(localItem => !remoteData.some(remoteItem => String(remoteItem.id) === String(localItem.id)))];
-        localStorage.setItem(key(type), JSON.stringify(merged));
-        if (merged.length !== remoteData.length) await saveCloudData(type, merged);
-      } catch {
-        // Keep cached records usable if synchronization is unavailable.
-      }
+
+      console.log(
+        `Cloud data loaded for year ${selectedYear}`
+      );
+    } else {
+      // First time for this year:
+      // upload existing local data to cloud.
+      await syncYearToCloud();
     }
+  } catch (error) {
+    console.error("Cloud load failed:", error);
   }
+}
+
+function saveData(type, data) {
+  localStorage.setItem(
+    key(type),
+    JSON.stringify(data)
+  );
+
+  // Save to Supabase also
+  syncYearToCloud();
+}
 
   // ===================================================
   // HELPERS
@@ -152,6 +172,11 @@ export function setupApp(element) {
     return Number(value || 0);
   }
 
+  // Load this year's data from Supabase after the cloud helpers are declared.
+  if (cloudReady) {
+    await loadYearFromCloud();
+  }
+
   function escapeHTML(value) {
     return String(value ?? "")
       .replaceAll("&", "&amp;")
@@ -161,464 +186,118 @@ export function setupApp(element) {
       .replaceAll("'", "&#039;");
   }
 
-  async function readResponse(response) {
-    const text = await response.text();
-
-    try {
-      return text ? JSON.parse(text) : {};
-    } catch {
-      return null;
-    }
-  }
-
-  function hashValue(value) {
-    let hash = 2166136261;
-
-    for (const character of value) {
-      hash ^= character.charCodeAt(0);
-      hash = Math.imul(hash, 16777619);
-    }
-
-    return (hash >>> 0).toString(16);
-  }
-
-  function authScreen() {
-    const savedAuth = localStorage.getItem(authKey);
-    let account = null;
-
-    try {
-      account = savedAuth ? JSON.parse(savedAuth) : null;
-    } catch {
-      account = null;
-    }
-
-    const hasAccount = Boolean(account?.loginId && account?.passwordHash);
-    const savedLoginId = account?.loginId || "";
-    const savedEmail = account?.email || "";
-
-    return authFormScreen(hasAccount, savedLoginId, savedEmail);
-  }
-
-  function authFormScreen(hasAccount, savedLoginId = "", savedEmail = "", mode = hasAccount ? "login" : "create") {
-    const isResetRequest = mode === "reset-request";
-    const isResetVerify = mode === "reset-verify";
-    const isCreate = mode === "create";
-
-    return `
-      <main class="auth-screen">
-        <section class="auth-card">
-          <div class="auth-mark">ॐ</div>
-          <span class="section-tag">GANPATI MANDAL ACCOUNTS</span>
-          <h1>${isResetRequest || isResetVerify ? "Reset password" : isCreate ? "Create your login" : "Welcome back"}</h1>
-          <p>
-            ${isResetRequest
-              ? "We will send a one-time password to your registered email."
-              : isResetVerify
-                ? "Enter the one-time password sent to your email."
-              : isCreate
-                ? "Create a login ID and password for this browser."
-                : "Sign in to view the expense records."}
-          </p>
-          <form id="authForm" class="auth-form" data-auth-mode="${mode}">
-            <label>
-              <span>Login ID</span>
-              <input id="authLoginId" type="text" minlength="3" maxlength="30" value="${isCreate ? "" : escapeHTML(savedLoginId)}" autocomplete="username" ${isResetVerify ? "readonly" : ""} required />
-            </label>
-            ${isCreate || isResetRequest || mode === "login" ? `
-              <label>
-                <span>Email address</span>
-                <input id="authEmail" type="email" value="${isCreate ? "" : escapeHTML(savedEmail)}" autocomplete="email" required />
-              </label>
-            ` : ""}
-            ${isResetVerify ? `
-              <label>
-                <span>One-time password</span>
-                <input id="authOtp" type="text" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" autocomplete="one-time-code" required />
-              </label>
-            ` : ""}
-            ${!isResetRequest ? `
-              <label>
-                <span>${isCreate ? "Create password" : isResetVerify ? "New password" : "Password"}</span>
-                <input id="authPassword" type="password" minlength="6" maxlength="64" autocomplete="${isCreate || isResetVerify ? "new-password" : "current-password"}" required />
-              </label>
-            ` : ""}
-            ${isCreate || isResetVerify ? `
-              <label>
-                <span>Confirm password</span>
-                <input id="authConfirmPassword" type="password" minlength="6" maxlength="64" autocomplete="new-password" required />
-              </label>
-            ` : ""}
-            <p id="authError" class="auth-error" role="alert"></p>
-            <button type="submit" class="save-btn">${isResetRequest ? "Send OTP" : isResetVerify ? "Reset password" : isCreate ? "Create account" : "Log in"}</button>
-          </form>
-          <div class="auth-links">
-            ${hasAccount && !isCreate && !isResetRequest && !isResetVerify ? `
-              <button type="button" class="auth-link" data-auth-mode="reset-request">Forgot password?</button>
-              <button type="button" class="auth-link" data-auth-mode="create">Create new account</button>
-            ` : !hasAccount && isCreate ? `
-              <button type="button" class="auth-link" data-auth-mode="login">Already have an account? Log in</button>
-            ` : `
-              <button type="button" class="auth-link" data-auth-mode="login">Back to login</button>
-            `}
-          </div>
-          <small class="auth-note">${isCreate ? "Your email is used only for password recovery." : "This protects access on this browser. OTPs expire after 10 minutes."}</small>
-        </section>
-      </main>
-    `;
-  }
-
-  function setupAuth() {
-    const form = document.querySelector("#authForm");
-    if (!form) return;
-
-    document.querySelectorAll("button[data-auth-mode]").forEach(button => {
-      button.addEventListener("click", () => {
-        const savedAuth = localStorage.getItem(authKey);
-        let account = null;
-
-        try {
-          account = savedAuth ? JSON.parse(savedAuth) : null;
-        } catch {
-          account = null;
-        }
-
-        element.innerHTML = authFormScreen(Boolean(account?.loginId && account?.passwordHash), account?.loginId || "", account?.email || "", button.dataset.authMode);
-        setupAuth();
-      });
-    });
-
-    form.addEventListener("submit", async event => {
-      event.preventDefault();
-
-      const loginId = document.querySelector("#authLoginId").value.trim();
-      const email = document.querySelector("#authEmail")?.value.trim().toLowerCase();
-      const password = document.querySelector("#authPassword")?.value || "";
-      const confirmPassword = document.querySelector("#authConfirmPassword");
-      const otp = document.querySelector("#authOtp")?.value.trim();
-      const error = document.querySelector("#authError");
-      const savedAuth = localStorage.getItem(authKey);
-      let account = null;
-      const mode = form.dataset.authMode;
-
-      if (savedAuth) {
-        try {
-          account = JSON.parse(savedAuth);
-        } catch {
-          account = null;
-        }
-      }
-
-      if (!loginId || loginId.length < 3) {
-        error.textContent = "Login ID must be at least 3 characters.";
-        return;
-      }
-
-      if ((mode === "create" || mode === "reset-verify") && confirmPassword && password !== confirmPassword.value) {
-        error.textContent = "Passwords do not match.";
-        return;
-      }
-
-      if (mode === "reset-request") {
-        if (!account || account.loginId !== loginId || account.email !== email) {
-          error.textContent = "Login ID and registered email do not match.";
-          return;
-        }
-
-        try {
-          const response = await fetch("/api/send-otp", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ loginId, email })
-          });
-          const result = await readResponse(response);
-          if (!response.ok || !result) throw new Error(result?.error || "OTP service is unavailable. Deploy the API and configure its environment variables.");
-          element.innerHTML = authFormScreen(true, loginId, email, "reset-verify");
-          setupAuth();
-        } catch (requestError) {
-          error.textContent = requestError.message;
-        }
-        return;
-      }
-
-      if (savedAuth && mode !== "create") {
-        if (mode === "login" && (!account || account.loginId !== loginId || account.passwordHash !== hashValue(password))) {
-          error.textContent = "Incorrect login ID or password.";
-          return;
-        }
-
-        if (mode === "login" && account.email && account.email !== email) {
-          error.textContent = "Incorrect login ID or password.";
-          return;
-        }
-
-        if (mode === "login" && !account.email) {
-          account.email = email;
-          localStorage.setItem(authKey, JSON.stringify(account));
-        }
-
-        if (mode === "login") {
-          try {
-            await fetch("/api/account", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ action: "create", ...account })
-            });
-          } catch {
-            // Existing local accounts can still log in while the service is offline.
-          }
-        }
-      }
-
-      if (mode === "reset-verify") {
-        if (!/^\d{6}$/.test(otp)) {
-          error.textContent = "Enter the 6-digit OTP.";
-          return;
-        }
-
-        try {
-          const response = await fetch("/api/verify-otp", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ loginId, email: account.email, otp })
-          });
-          const result = await readResponse(response);
-          if (!response.ok || !result) throw new Error(result?.error || "OTP service is unavailable. Deploy the API and configure its environment variables.");
-        } catch (requestError) {
-          error.textContent = requestError.message;
-          return;
-        }
-      }
-
-      if (mode === "login" && !account) {
-        try {
-          const response = await fetch("/api/account", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ action: "login", loginId, email, passwordHash: hashValue(password) })
-          });
-          const result = await readResponse(response);
-          if (!response.ok || !result?.account) throw new Error(result?.error || "Incorrect login ID, email, or password.");
-          account = result.account;
-          localStorage.setItem(authKey, JSON.stringify(account));
-        } catch (requestError) {
-          error.textContent = requestError.message;
-          return;
-        }
-      }
-
-      if (mode === "create" || mode === "reset-verify") {
-        const nextAccount = {
-          loginId,
-          email: mode === "create" ? email : account.email,
-          passwordHash: hashValue(password)
-        };
-
-        if (mode === "create") {
-          try {
-            const response = await fetch("/api/account", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ action: "create", ...nextAccount })
-            });
-            const result = await readResponse(response);
-            if (!response.ok || !result?.account) throw new Error(result?.error || "Unable to create shared account.");
-          } catch (requestError) {
-            error.textContent = requestError.message;
-            return;
-          }
-          localStorage.setItem(authKey, JSON.stringify(nextAccount));
-        }
-        localStorage.setItem(authKey, JSON.stringify(nextAccount));
-      }
-
-      sessionStorage.setItem("ganpati_unlocked", "true");
-      isUnlocked = true;
-      await syncCloudData(getLocalAccount());
-      render("home");
-    });
-  }
-
   function today() {
     return new Date().toLocaleDateString("en-IN");
   }
 
   // ===================================================
-  // VARGANI SUMMARY
+  // CALCULATIONS
   // ===================================================
 
   function getCollectionSummary(type) {
-
     const data = getData(type);
 
     const total = data.reduce(
-      (sum, item) =>
-        sum + num(item.total),
+      (sum, item) => sum + num(item.total),
       0
     );
 
     const paid = data.reduce(
-      (sum, item) =>
-        sum + num(item.paid),
+      (sum, item) => sum + num(item.paid),
       0
     );
 
     return {
       total,
       paid,
-      remaining: Math.max(0, total - paid),
+      remaining: total - paid,
       count: data.length
     };
   }
 
-  // ===================================================
-  // BAND SUMMARY
-  // ===================================================
-
   function getBandPaid(item) {
-
-    // New records use paid.
-    // Old records may have advance.
-    // Both are supported.
-
-    if (
-      item.paid !== undefined &&
-      item.paid !== null
-    ) {
-      return num(item.paid);
-    }
-
-    return num(item.advance);
+    // New records use `paid`. Older saved records used `advance`,
+    // so both are supported to avoid losing existing data.
+    return num(item.paid ?? item.advance);
   }
 
   function getVisarjanSummary() {
-
     const data = getData("visarjan");
 
     const total = data.reduce(
-      (sum, item) =>
-        sum + num(item.total),
+      (sum, item) => sum + num(item.total),
       0
     );
 
     const paid = data.reduce(
-      (sum, item) =>
-        sum + getBandPaid(item),
+      (sum, item) => sum + getBandPaid(item),
       0
     );
 
     return {
       total,
       paid,
-      remaining: Math.max(0, total - paid),
+      remaining: total - paid,
       count: data.length
     };
   }
 
-  // ===================================================
-  // HAAT KARACH / EXPENSE SUMMARY
-  // ===================================================
-
   function getExpenseSummary() {
-
     const data = getData("expenses");
 
     const total = data.reduce(
-      (sum, item) =>
-        sum + num(item.total),
+      (sum, item) => sum + num(item.total),
       0
     );
 
     const paid = data.reduce(
-      (sum, item) =>
-        sum + num(item.paid),
+      (sum, item) => sum + num(item.paid),
       0
     );
 
     return {
       total,
       paid,
-      remaining: Math.max(0, total - paid),
+      remaining: total - paid,
       count: data.length
     };
   }
 
-  // ===================================================
-  // OVERALL SUMMARY
-  // ===================================================
-
   function getOverallSummary() {
+    let total = 0;
+    let paid = 0;
 
-    let collectionTotal = 0;
-    let collectionPaid = 0;
+    Object.keys(collectionTypes).forEach(type => {
+      const s = getCollectionSummary(type);
 
-    Object.keys(collectionTypes)
-      .forEach(type => {
+      total += s.total;
+      paid += s.paid;
+    });
 
-        const summary =
-          getCollectionSummary(type);
+    const visarjan = getVisarjanSummary();
 
-        collectionTotal += summary.total;
-        collectionPaid += summary.paid;
-      });
+    // Visarjan is a booking commitment,
+    // so it is shown separately and not added
+    // to normal Vargani collection.
 
-    const collectionRemaining =
-      Math.max(
-        0,
-        collectionTotal - collectionPaid
-      );
-
-    const band =
-      getVisarjanSummary();
-
-    const expenses =
-      getExpenseSummary();
-
-    // ===============================================
-    // IMPORTANT ACCOUNTING
-    //
-    // Band Total is NOT part of Vargani.
-    //
-    // Cash in hand:
-    //
-    // Vargani Paid
-    // - Haat Karach Paid
-    // - Band Paid
-    //
-    // ===============================================
-
-    const cashInHand =
-      collectionPaid -
-      expenses.paid -
-      band.paid;
+    const expenses = getExpenseSummary();
 
     return {
+      collectionTotal: total,
+      collectionPaid: paid,
+      collectionRemaining: total - paid,
 
-      collectionTotal,
+      visarjanTotal: visarjan.total,
+      visarjanAdvance: visarjan.paid,
+      visarjanRemaining: visarjan.remaining,
 
-      collectionPaid,
+      expenseTotal: expenses.total,
+      expensePaid: expenses.paid,
+      expenseRemaining: expenses.remaining,
 
-      collectionRemaining,
-
-      visarjanTotal:
-        band.total,
-
-      visarjanAdvance:
-        band.paid,
-
-      visarjanRemaining:
-        band.remaining,
-
-      expenseTotal:
-        expenses.total,
-
-      expensePaid:
-        expenses.paid,
-
-      expenseRemaining:
-        expenses.remaining,
-
-      cashInHand
-
+      // Actual cash available = Vargani Paid - Haat Karach Paid - Band Paid.
+      // Band is separate from Vargani totals, but its paid amount is actual cash outflow.
+      cashInHand: paid - expenses.paid - visarjan.paid
     };
   }
 
@@ -627,7 +306,6 @@ export function setupApp(element) {
   // ===================================================
 
   function layout(content) {
-
     return `
       <div class="app-shell">
 
@@ -639,8 +317,8 @@ export function setupApp(element) {
               🪔
             </div>
 
-            <div class="brand-text">
-              <h2>नवयुवक गणेश मंडळ 🙏</h2>
+            <div>
+              <h2>Ganpati</h2>
               <span>Accounts Book</span>
             </div>
 
@@ -682,10 +360,6 @@ export function setupApp(element) {
               "Family Vargani"
             )}
 
-            <div class="nav-group-title">
-              💸 जमा-खर्च
-            </div>
-
             ${navButton(
               "visarjan",
               "🎺",
@@ -701,7 +375,7 @@ export function setupApp(element) {
             ${navButton(
               "report",
               "📊",
-              "जमा-खर्च Report"
+              "जमा-खर्च"
             )}
 
           </nav>
@@ -714,28 +388,32 @@ export function setupApp(element) {
               <span>📅</span>
 
               <div>
-                <small>
-                  Selected Year
-                </small>
-
-                <strong>
-                  ${selectedYear}
-                </strong>
+                <small>Selected Year</small>
+                <strong>${selectedYear}</strong>
               </div>
 
             </div>
 
-            <button
-              id="logoutApp"
-              class="logout-sidebar-btn"
-              type="button"
-              title="Logout"
-            >
-              🚪 Logout
-            </button>
-
             <div class="sidebar-footer">
               Develop by Chetan Bhoge
+
+              <button
+                id="logoutBtn"
+                type="button"
+                style="
+                  margin-top:12px;
+                  width:100%;
+                  padding:9px 12px;
+                  border:1px solid rgba(255,255,255,.22);
+                  border-radius:10px;
+                  background:rgba(255,255,255,.08);
+                  color:inherit;
+                  cursor:pointer;
+                "
+              >
+                Logout
+              </button>
+
             </div>
 
           </div>
@@ -745,51 +423,45 @@ export function setupApp(element) {
 
         <main class="main-area">
 
-          <header class="top-header">
+          <header class="topbar">
 
             <div>
 
-              <span class="header-overline">
-                GANPATI MANDAL · ACCOUNTS
-              </span>
-
               <h1>
-                Ganpati Accounts Dashboard
+                ${pageTitle()}
               </h1>
+
+              <p>
+                Ganpati Mandal Accounts
+              </p>
 
             </div>
 
 
-            <div class="header-actions">
+            <div class="topbar-actions">
 
-              <div class="header-year">
+              <label class="year-selector">
 
-                <small>
-                  Accounting Year
-                </small>
+                <span>Year</span>
 
-                <select id="yearSelector" aria-label="Accounting Year">
-                  ${availableYears.map(year => `
-                    <option value="${year}" ${year === selectedYear ? "selected" : ""}>
-                      ${year}
-                    </option>
-                  `).join("")}
+                <select id="yearSelect">
+
+                  ${yearOptions()}
+
                 </select>
 
-              </div>
+              </label>
 
             </div>
 
           </header>
 
 
-          ${content}
+          <section class="content-area">
 
+            ${content}
 
-          <footer class="app-footer">
-            🔒 Your data is saved securely in this browser ·
-            Ganpati Mandal Accounts ${selectedYear}
-          </footer>
+          </section>
 
         </main>
 
@@ -797,22 +469,18 @@ export function setupApp(element) {
     `;
   }
 
+
   // ===================================================
-  // NAV BUTTON
+  // NAVIGATION
   // ===================================================
 
-  function navButton(
-    page,
-    icon,
-    text
-  ) {
+  function navButton(page, icon, label) {
 
     return `
       <button
-        class="nav-btn ${
-          currentPage === page
-            ? "active"
-            : ""
+        type="button"
+        class="nav-item ${
+          currentPage === page ? "active" : ""
         }"
         data-page="${page}"
       >
@@ -822,174 +490,80 @@ export function setupApp(element) {
         </span>
 
         <span>
-          ${text}
+          ${label}
         </span>
 
       </button>
     `;
   }
 
-  // ===================================================
-  // MAIN RENDER
-  // ===================================================
 
-  function render(page = "home") {
+  function pageTitle() {
 
-    if (!isUnlocked) {
-      element.innerHTML = authScreen();
-      setupAuth();
-      return;
+    if (currentPage === "home") {
+      return "Dashboard";
     }
 
-    currentPage = page;
-
-    let content = "";
-
-    if (page === "home") {
-      content = homePage();
+    if (collectionTypes[currentPage]) {
+      return collectionTypes[currentPage].title;
     }
 
-    if (page === "boys") {
-      content = varganiPage("boys");
+    if (currentPage === "visarjan") {
+      return "Band / Visarjan";
     }
 
-    if (page === "main") {
-      content = varganiPage("main");
+    if (currentPage === "expenses") {
+      return "Haat Karach / खर्च";
     }
 
-    if (page === "family") {
-      content = varganiPage("family");
+    if (currentPage === "report") {
+      return "जमा-खर्च Report";
     }
 
-    if (page === "visarjan") {
-      content = visarjanPage();
-    }
+    return "Ganpati Accounts";
+  }
 
-    if (page === "expenses") {
-      content = expensesPage();
-    }
 
-    if (page === "report") {
-      content = reportPage();
-    }
+  function yearOptions() {
 
-    element.innerHTML =
-      layout(content);
+    const current =
+      Number(new Date().getFullYear());
 
-    bindNavigation();
+    let html = "";
 
-    if (page === "home") {
-      setupHome();
-    }
-
-    if (
-      page === "boys" ||
-      page === "main" ||
-      page === "family"
+    for (
+      let year = current - 2;
+      year <= current + 3;
+      year++
     ) {
-      setupVargani(page);
-    }
 
-    if (page === "visarjan") {
-      setupVisarjan();
-    }
-
-    if (page === "expenses") {
-      setupExpenses();
-    }
-
-    if (page === "report") {
-      setupReport();
-    }
-  }
-
-  // ===================================================
-  // NAVIGATION
-  // ===================================================
-
-  function bindNavigation() {
-
-    document
-      .querySelectorAll("[data-page]")
-      .forEach(button => {
-
-        button.addEventListener(
-          "click",
-          () => {
-
-            const page =
-              button.dataset.page;
-
-            render(page);
+      html += `
+        <option
+          value="${year}"
+          ${
+            String(year) === String(selectedYear)
+              ? "selected"
+              : ""
           }
-        );
+        >
+          ${year}
+        </option>
+      `;
 
-      });
-
-    const logoutButton = document.querySelector("#logoutApp");
-
-    const yearSelector = document.querySelector("#yearSelector");
-
-    if (yearSelector) {
-      yearSelector.addEventListener("change", event => {
-        selectedYear = event.target.value;
-        localStorage.setItem("ganpati_selected_year", selectedYear);
-        render(currentPage);
-      });
     }
 
-    if (logoutButton) {
-      logoutButton.addEventListener("click", () => {
-        sessionStorage.removeItem("ganpati_unlocked");
-        isUnlocked = false;
-        render();
-      });
-    }
+    return html;
   }
 
-  // ===================================================
-  // SUMMARY CARD
-  // ===================================================
-
-  function summaryCard(
-    icon,
-    title,
-    amount,
-    subtitle
-  ) {
-
-    return `
-      <div class="summary-card">
-
-        <div class="summary-icon">
-          ${icon}
-        </div>
-
-        <div>
-
-          <span>
-            ${title}
-          </span>
-
-          <strong>
-            ${money(amount)}
-          </strong>
-
-          <small>
-            ${subtitle}
-          </small>
-
-        </div>
-
-      </div>
-    `;
-  }
 
   // ===================================================
   // HOME PAGE
   // ===================================================
 
-  function homePage() {
+  function renderHome() {
+
+    const summary =
+      getOverallSummary();
 
     const boys =
       getCollectionSummary("boys");
@@ -1006,321 +580,500 @@ export function setupApp(element) {
     const expenses =
       getExpenseSummary();
 
-    const overall =
-      getOverallSummary();
 
     return `
-      <section class="page">
 
-        <div class="hero">
+      <div class="page-header">
 
-          <div>
+        <div>
 
-            <span class="section-tag">
-              🙏 गणपती बाप्पा मोरया
-            </span>
+          <h2>
+            नमस्कार 🙏
+          </h2>
 
-            <h2>
-              Namaste, Organizer 👋
-            </h2>
-
-            <p>
-              Manage your Ganpati Mandal
-              collections and expenses easily.
-            </p>
-
-          </div>
-
-
-          <button
-            class="primary-btn"
-            data-page="boys"
-          >
-            + Add Vargani
-          </button>
+          <p>
+            ${selectedYear} Ganpati Mandal Accounts
+          </p>
 
         </div>
 
-
-        <!-- ===================================== -->
-        <!-- MAIN VARGANI SUMMARY -->
-        <!-- ===================================== -->
-
-        <div class="section-heading">
-
-          <div>
-            <span class="section-tag">
-              💰 VARGANI
-            </span>
-
-            <h3>
-              Vargani Overview
-            </h3>
-          </div>
-
+        <div class="header-badge">
+          🪔 ${selectedYear}
         </div>
 
+      </div>
 
-        <div class="summary-grid four">
 
-          ${summaryCard(
-            "💰",
-            "Total Vargani",
-            overall.collectionTotal,
-            "Boys + Main + Family"
-          )}
+      <!-- CASH IN HAND -->
 
-          ${summaryCard(
-            "✅",
-            "Vargani Paid",
-            overall.collectionPaid,
-            "Total जमा"
-          )}
+      <div class="cash-card">
 
-          ${summaryCard(
-            "⏳",
-            "Vargani Remaining",
-            overall.collectionRemaining,
-            "बाकी वर्गणी"
-          )}
+        <div class="cash-card-main">
 
-          ${summaryCard(
-            "👥",
-            "Total Records",
-            boys.count +
-              main.count +
-              family.count,
-            "All Vargani records"
-          )}
-
-        </div>
-
-
-        <!-- ===================================== -->
-        <!-- HAND CASH CARD -->
-        <!-- ===================================== -->
-
-        <div class="cash-in-hand-card">
-
-          <div class="overview-top">
-
-            <div class="overview-icon">
-              💵
-            </div>
-
-            <div>
-
-              <span>
-                हातातील रक्कम
-              </span>
-
-              <strong>
-                ${money(
-                  overall.cashInHand
-                )}
-              </strong>
-
-              <small>
-                Vargani Paid − Haat Karach Paid − Band Paid
-              </small>
-
-            </div>
-
-          </div>
-
-
-          <div class="mini-stats">
-
-            <div>
-              <span>
-                Vargani Paid
-              </span>
-
-              <strong>
-                ${money(
-                  overall.collectionPaid
-                )}
-              </strong>
-            </div>
-
-
-            <div>
-              <span>
-                Haat Karach Paid
-              </span>
-
-              <strong>
-                ${money(
-                  overall.expensePaid
-                )}
-              </strong>
-            </div>
-
-
-            <div>
-              <span>
-                Band Paid
-              </span>
-
-              <strong>
-                ${money(
-                  overall.visarjanAdvance
-                )}
-              </strong>
-            </div>
-
-          </div>
-
-        </div>
-
-
-        <!-- ===================================== -->
-        <!-- VARGANI DETAILS -->
-        <!-- ===================================== -->
-
-        <div class="section-heading">
-
-          <div>
-            <span class="section-tag">
-              📋 DETAILS
-            </span>
-
-            <h3>
-              Vargani Sections
-            </h3>
-          </div>
-
-        </div>
-
-
-        <div class="overview-grid">
-
-          ${overviewCard(
-            "👦",
-            "Boys Vargani",
-            boys,
-            "boys"
-          )}
-
-          ${overviewCard(
-            "⭐",
-            "Main Vargani",
-            main,
-            "main"
-          )}
-
-          ${overviewCard(
-            "👨‍👩‍👧",
-            "Family Vargani",
-            family,
-            "family"
-          )}
-
-        </div>
-
-
-        <!-- ===================================== -->
-        <!-- HAAT KARACH + BAND -->
-        <!-- ===================================== -->
-
-        <div class="section-heading">
-
-          <div>
-            <span class="section-tag">
-              💸 EXPENSES
-            </span>
-
-            <h3>
-              Haat Karach & Band
-            </h3>
-          </div>
-
-        </div>
-
-
-        <div class="overview-grid">
-
-          ${overviewCard(
-            "💸",
-            "Haat Karach",
-            expenses,
-            "expenses"
-          )}
-
-          ${overviewCard(
-            "🎺",
-            "Band / Visarjan",
-            {
-              total: band.total,
-              paid: band.paid,
-              remaining: band.remaining,
-              count: band.count
-            },
-            "visarjan"
-          )}
-
-        </div>
-
-
-        <!-- ===================================== -->
-        <!-- ACCOUNTING NOTE -->
-        <!-- ===================================== -->
-
-        <div class="card">
-
-          <div class="overview-top">
-
-            <div class="overview-icon">
-              ℹ️
-            </div>
-
-            <div>
-
-              <span>
-                Accounting Note
-              </span>
-
-              <p>
-                Band booking Vargani मध्ये
-                add होत नाही. पण Band ला दिलेली
-                Paid / जमा रक्कम हातातील
-                पैशातून deduct होते.
-              </p>
-
-            </div>
-
-          </div>
-
-        </div>
-
-      </section>
-    `;
-  }
-
-  // ===================================================
-  // OVERVIEW CARD
-  // ===================================================
-
-  function overviewCard(
-    icon,
-    title,
-    summary,
-    page
-  ) {
-
-    return `
-      <div class="overview-card">
-
-        <div class="overview-top">
-
-          <div class="overview-icon">
-            ${icon}
+          <div class="cash-icon">
+            💰
           </div>
 
           <div>
 
             <span>
+              हातातील रक्कम
+            </span>
+
+            <strong>
+              ${money(summary.cashInHand)}
+            </strong>
+
+            <small>
+              Vargani Paid − Haat Karach Paid − Band Paid
+            </small>
+
+          </div>
+
+        </div>
+
+
+        <div class="cash-mini-stats">
+
+          <div>
+            <span>Vargani Paid</span>
+            <strong>
+              ${money(summary.collectionPaid)}
+            </strong>
+          </div>
+
+          <div>
+            <span>Haat Karach Paid</span>
+            <strong>
+              ${money(summary.expensePaid)}
+            </strong>
+          </div>
+
+          <div>
+            <span>Band Paid</span>
+            <strong>
+              ${money(summary.visarjanAdvance)}
+            </strong>
+          </div>
+
+        </div>
+
+      </div>
+
+
+      <!-- COLLECTION SUMMARY -->
+
+      <div class="section-title">
+
+        <div>
+          <h3>
+            Vargani Summary
+          </h3>
+
+          <p>
+            वर्गणीचे एकूण जमा / बाकी
+          </p>
+        </div>
+
+      </div>
+
+
+      <div class="summary-grid">
+
+        ${summaryCard(
+          "👦",
+          "Boys Vargani",
+          boys.total,
+          boys.paid,
+          boys.remaining
+        )}
+
+        ${summaryCard(
+          "⭐",
+          "Main Vargani",
+          main.total,
+          main.paid,
+          main.remaining
+        )}
+
+        ${summaryCard(
+          "👨‍👩‍👧",
+          "Family Vargani",
+          family.total,
+          family.paid,
+          family.remaining
+        )}
+
+        ${summaryCard(
+          "💰",
+          "Total Vargani",
+          summary.collectionTotal,
+          summary.collectionPaid,
+          summary.collectionRemaining
+        )}
+
+      </div>
+
+
+      <!-- BAND / EXPENSE -->
+
+      <div class="section-title">
+
+        <div>
+          <h3>
+            Other Accounts
+          </h3>
+
+          <p>
+            Band आणि Haat Karach स्वतंत्र ठेवले आहेत
+          </p>
+        </div>
+
+      </div>
+
+
+      <div class="summary-grid">
+
+        ${summaryCard(
+          "🎺",
+          "Band / Visarjan",
+          band.total,
+          band.paid,
+          band.remaining
+        )}
+
+        ${summaryCard(
+          "💸",
+          "Haat Karach / खर्च",
+          expenses.total,
+          expenses.paid,
+          expenses.remaining
+        )}
+
+      </div>
+
+
+      <!-- RECENT -->
+
+      ${renderRecentActivity()}
+
+    `;
+  }
+
+
+  function summaryCard(
+    icon,
+    title,
+    total,
+    paid,
+    remaining
+  ) {
+
+    return `
+      <div class="summary-card">
+
+        <div class="summary-card-top">
+
+          <div class="summary-icon">
+            ${icon}
+          </div>
+
+          <div>
+
+            <h4>
               ${title}
+            </h4>
+
+            <span>
+              Total
+            </span>
+
+          </div>
+
+        </div>
+
+
+        <div class="summary-total">
+          ${money(total)}
+        </div>
+
+
+        <div class="summary-row">
+
+          <div>
+            <span>Paid / जमा</span>
+            <strong>
+              ${money(paid)}
+            </strong>
+          </div>
+
+          <div>
+            <span>Remaining / बाकी</span>
+            <strong>
+              ${money(remaining)}
+            </strong>
+          </div>
+
+        </div>
+
+      </div>
+    `;
+  }
+
+
+  // ===================================================
+  // RECENT ACTIVITY
+  // ===================================================
+
+  function renderRecentActivity() {
+
+    const all = [];
+
+    Object.keys(collectionTypes)
+      .forEach(type => {
+
+        getData(type)
+          .slice(-5)
+          .forEach(item => {
+
+            all.push({
+              ...item,
+              section:
+                collectionTypes[type].title,
+              icon:
+                collectionTypes[type].icon
+            });
+
+          });
+
+      });
+
+
+    getData("visarjan")
+      .slice(-5)
+      .forEach(item => {
+
+        all.push({
+          ...item,
+          section: "Band / Visarjan",
+          icon: "🎺"
+        });
+
+      });
+
+
+    getData("expenses")
+      .slice(-5)
+      .forEach(item => {
+
+        all.push({
+          ...item,
+          section: "Haat Karach / खर्च",
+          icon: "💸"
+        });
+
+      });
+
+
+    const recent =
+      all.slice(-8).reverse();
+
+
+    if (!recent.length) {
+
+      return `
+        <div class="empty-card">
+
+          <div>
+            📋
+          </div>
+
+          <h3>
+            No transactions yet
+          </h3>
+
+          <p>
+            Add your first Vargani, Band or Expense entry.
+          </p>
+
+        </div>
+      `;
+
+    }
+
+
+    return `
+
+      <div class="section-title">
+
+        <div>
+
+          <h3>
+            Recent Activity
+          </h3>
+
+          <p>
+            अलीकडील नोंदी
+          </p>
+
+        </div>
+
+      </div>
+
+
+      <div class="activity-card">
+
+        ${recent.map(item => `
+
+          <div class="activity-row">
+
+            <div class="activity-icon">
+              ${item.icon}
+            </div>
+
+            <div class="activity-info">
+
+              <strong>
+                ${escapeHTML(
+                  item.name ||
+                  item.person ||
+                  item.bandName ||
+                  item.title ||
+                  "Entry"
+                )}
+              </strong>
+
+              <span>
+                ${item.section}
+              </span>
+
+            </div>
+
+            <div class="activity-amount">
+
+              <strong>
+                ${money(item.paid)}
+              </strong>
+
+              <span>
+                Paid
+              </span>
+
+            </div>
+
+          </div>
+
+        `).join("")}
+
+      </div>
+
+    `;
+  }  // ===================================================
+  // COLLECTION PAGE
+  // ===================================================
+
+  function renderCollectionPage(type) {
+
+    const config =
+      collectionTypes[type];
+
+    const summary =
+      getCollectionSummary(type);
+
+    const data =
+      getData(type);
+
+
+    return `
+
+      <div class="page-header">
+
+        <div>
+
+          <h2>
+            ${config.icon} ${config.title}
+          </h2>
+
+          <p>
+            ${selectedYear} मधील सर्व नोंदी
+          </p>
+
+        </div>
+
+
+        <button
+          type="button"
+          class="primary-button"
+          data-action="add-entry"
+          data-type="${type}"
+        >
+          + Add Entry
+        </button>
+
+      </div>
+
+
+      <!-- SUMMARY -->
+
+      <div class="summary-grid">
+
+        ${summaryCard(
+          "💰",
+          "Total",
+          summary.total,
+          summary.paid,
+          summary.remaining
+        )}
+
+        ${smallStatCard(
+          "जमा / Paid",
+          summary.paid,
+          "💵"
+        )}
+
+        ${smallStatCard(
+          "बाकी / Remaining",
+          summary.remaining,
+          "⏳"
+        )}
+
+        ${smallStatCard(
+          "Entries",
+          summary.count,
+          "📋",
+          true
+        )}
+
+      </div>
+
+
+      <!-- ENTRY FORM -->
+
+      <div id="${type}FormContainer"></div>
+
+
+      <!-- TABLE -->
+
+      <div class="table-card">
+
+        <div class="table-card-header">
+
+          <div>
+
+            <h3>
+              ${config.title} Entries
+            </h3>
+
+            <p>
+              Total ${data.length} entries
+            </p>
+
+          </div>
+
+          <div class="table-total">
+
+            <span>
+              Total
             </span>
 
             <strong>
@@ -1332,2391 +1085,579 @@ export function setupApp(element) {
         </div>
 
 
-        <div class="mini-stats">
+        ${
+          data.length
+            ? collectionTable(type, data)
+            : emptyTable(config.title)
+        }
 
-          <div>
-            <span>
-              Paid / जमा
-            </span>
+      </div>
 
-            <strong>
-              ${money(summary.paid)}
-            </strong>
-          </div>
+    `;
+  }
 
 
-          <div>
-            <span>
-              Remaining
-            </span>
+  function smallStatCard(
+    title,
+    value,
+    icon,
+    plainNumber = false
+  ) {
 
-            <strong>
-              ${money(summary.remaining)}
-            </strong>
-          </div>
+    return `
+      <div class="small-stat-card">
 
+        <div class="small-stat-icon">
+          ${icon}
         </div>
 
+        <div>
 
-        <button
-          class="view-link"
-          data-page="${page}"
-        >
-          View Details →
-        </button>
+          <span>
+            ${title}
+          </span>
+
+          <strong>
+            ${
+              plainNumber
+                ? value
+                : money(value)
+            }
+          </strong>
+
+        </div>
 
       </div>
     `;
   }
 
-  // ===================================================
-  // HOME SETUP
-  // ===================================================
-
-  function setupHome() {
-    // Home buttons use data-page.
-    // Navigation is already bound.
-  }
 
   // ===================================================
-  // VARGANI PAGE
+  // COLLECTION TABLE
   // ===================================================
 
-  function varganiPage(type) {
-
-    const config =
-      collectionTypes[type];
-
-    const summary =
-      getCollectionSummary(type);
+  function collectionTable(type, data) {
 
     return `
-      <section class="page">
 
-        <div class="page-heading">
+      <div class="table-responsive">
 
-          <button
-            class="back-btn"
-            data-page="home"
-          >
-            ← Home
-          </button>
+        <table class="data-table">
 
-          <span class="section-tag">
-            ${config.icon} VARGANI
-          </span>
+          <thead>
 
-          <h2>
-            ${config.title}
-          </h2>
+            <tr>
 
-          <p>
-            Add and manage ${config.label}
-            Vargani records.
-          </p>
+              <th>#</th>
 
-        </div>
+              <th>Name</th>
 
+              <th>Mobile</th>
 
-        <div class="summary-grid three">
+              <th>Total</th>
 
-          ${summaryCard(
-            "💰",
-            "Total",
-            summary.total,
-            `${summary.count} records`
-          )}
+              <th>Paid / जमा</th>
 
-          ${summaryCard(
-            "✅",
-            "Paid / जमा",
-            summary.paid,
-            "Amount received"
-          )}
+              <th>Remaining / बाकी</th>
 
-          ${summaryCard(
-            "⏳",
-            "Remaining",
-            summary.remaining,
-            "Amount pending"
-          )}
+              <th>Remarks</th>
 
-        </div>
+              <th>Actions</th>
 
+            </tr>
 
-        <div class="form-card">
+          </thead>
 
-          <div class="form-title">
 
-            <div>
+          <tbody>
 
-              <span>
-                ${config.label.toUpperCase()}
-                VARGANI
-              </span>
+            ${data.map((item, index) => {
 
-              <h3>
-                + Add ${config.title}
-              </h3>
+              const total =
+                num(item.total);
 
-            </div>
+              const paid =
+                num(item.paid);
 
-          </div>
+              const remaining =
+                total - paid;
 
 
-          <form
-            id="varganiForm"
-            class="data-form"
-          >
-
-            <div class="form-grid">
-
-              <label>
-
-                <span>
-                  Name *
-                </span>
-
-                <input
-                  id="recordName"
-                  type="text"
-                  placeholder="Enter name"
-                  required
-                />
-
-              </label>
-
-
-              <label>
-
-                <span>
-                  Total Amount *
-                </span>
-
-                <input
-                  id="recordTotal"
-                  type="number"
-                  min="0"
-                  placeholder="₹ Total"
-                  required
-                />
-
-              </label>
-
-
-              <label>
-
-                <span>
-                  Paid / जमा *
-                </span>
-
-                <input
-                  id="recordPaid"
-                  type="number"
-                  min="0"
-                  placeholder="₹ Paid"
-                  required
-                />
-
-              </label>
-
-
-              <label>
-
-                <span>
-                  Remaining
-                </span>
-
-                <input
-                  id="recordRemaining"
-                  type="number"
-                  readonly
-                  value="0"
-                />
-
-              </label>
-
-
-              <label class="full">
-
-                <span>
-                  Remarks
-                </span>
-
-                <textarea
-                  id="recordRemarks"
-                  rows="2"
-                  placeholder="Enter remarks..."
-                ></textarea>
-
-              </label>
-
-            </div>
-
-
-            <div class="form-actions">
-
-              <button
-                type="submit"
-                class="save-btn"
-              >
-                💾 Save Vargani
-              </button>
-
-              <button
-                type="reset"
-                class="cancel-btn"
-              >
-                Clear
-              </button>
-
-            </div>
-
-          </form>
-
-        </div>
-
-
-        <div class="table-card">
-
-          <div class="table-heading">
-
-            <div>
-
-              <span>
-                RECORDS
-              </span>
-
-              <h3>
-                ${config.title} List
-              </h3>
-
-            </div>
-
-            <strong>
-              ${summary.count} Records
-            </strong>
-
-          </div>
-
-
-          <div class="table-scroll">
-
-            <table>
-
-              <thead>
+              return `
 
                 <tr>
-                  <th>#</th>
-                  <th>Name</th>
-                  <th>Total</th>
-                  <th>Paid / जमा</th>
-                  <th>Remaining</th>
-                  <th>Remarks</th>
-                  <th>Date</th>
-                  <th>Action</th>
+
+                  <td>
+                    ${index + 1}
+                  </td>
+
+
+                  <td>
+
+                    <div class="person-cell">
+
+                      <div class="person-avatar">
+                        ${
+                          collectionTypes[type]
+                            .icon
+                        }
+                      </div>
+
+                      <strong>
+                        ${escapeHTML(
+                          item.name || ""
+                        )}
+                      </strong>
+
+                    </div>
+
+                  </td>
+
+
+                  <td>
+                    ${escapeHTML(
+                      item.mobile || "-"
+                    )}
+                  </td>
+
+
+                  <td>
+                    <strong>
+                      ${money(total)}
+                    </strong>
+                  </td>
+
+
+                  <td>
+                    <span class="paid-badge">
+                      ${money(paid)}
+                    </span>
+                  </td>
+
+
+                  <td>
+
+                    <span class="${
+                      remaining > 0
+                        ? "remaining-badge"
+                        : "paid-full-badge"
+                    }">
+
+                      ${money(remaining)}
+
+                    </span>
+
+                  </td>
+
+
+                  <td>
+
+                    <span class="remarks-text">
+                      ${escapeHTML(
+                        item.remarks || "-"
+                      )}
+                    </span>
+
+                  </td>
+
+
+                  <td>
+
+                    <div class="table-actions">
+
+                      <button
+                        type="button"
+                        class="icon-button edit"
+                        data-action="edit-entry"
+                        data-type="${type}"
+                        data-id="${item.id}"
+                        title="Edit"
+                      >
+                        ✏️
+                      </button>
+
+
+                      <button
+                        type="button"
+                        class="icon-button delete"
+                        data-action="delete-entry"
+                        data-type="${type}"
+                        data-id="${item.id}"
+                        title="Delete"
+                      >
+                        🗑️
+                      </button>
+
+                    </div>
+
+                  </td>
+
                 </tr>
 
-              </thead>
+              `;
 
-              <tbody id="varganiTable"></tbody>
+            }).join("")}
 
-            </table>
+          </tbody>
 
-          </div>
+        </table>
 
-        </div>
+      </div>
 
-      </section>
     `;
   }
 
-  // ===================================================
-  // SETUP VARGANI
-  // ===================================================
 
-  function setupVargani(type) {
+  function emptyTable(title) {
 
-    const form =
-      document.querySelector(
-        "#varganiForm"
-      );
+    return `
 
-    if (!form) return;
+      <div class="empty-table">
 
-    const totalInput =
-      document.querySelector(
-        "#recordTotal"
-      );
+        <div class="empty-icon">
+          📋
+        </div>
 
-    const paidInput =
-      document.querySelector(
-        "#recordPaid"
-      );
+        <h3>
+          No ${escapeHTML(title)} entries
+        </h3>
 
-    const remainingInput =
-      document.querySelector(
-        "#recordRemaining"
-      );
+        <p>
+          Add your first entry using the button above.
+        </p>
 
-    function calculateRemaining() {
+      </div>
 
-      const total =
-        num(totalInput.value);
-
-      const paid =
-        num(paidInput.value);
-
-      remainingInput.value =
-        Math.max(
-          0,
-          total - paid
-        );
-    }
-
-    totalInput.addEventListener(
-      "input",
-      calculateRemaining
-    );
-
-    paidInput.addEventListener(
-      "input",
-      calculateRemaining
-    );
-
-    form.addEventListener(
-      "submit",
-      event => {
-
-        event.preventDefault();
-
-        const name =
-          document
-            .querySelector(
-              "#recordName"
-            )
-            .value
-            .trim();
-
-        const total =
-          num(totalInput.value);
-
-        const paid =
-          num(paidInput.value);
-
-        const remarks =
-          document
-            .querySelector(
-              "#recordRemarks"
-            )
-            .value
-            .trim();
-
-        if (
-          !name ||
-          total <= 0
-        ) {
-
-          alert(
-            "Please enter Name and Total Amount."
-          );
-
-          return;
-        }
-
-        if (paid > total) {
-
-          alert(
-            "Paid amount cannot be greater than Total."
-          );
-
-          return;
-        }
-
-        const data =
-          getData(type);
-
-        data.push({
-
-          id: Date.now(),
-
-          name,
-
-          total,
-
-          paid,
-
-          remaining:
-            total - paid,
-
-          remarks,
-
-          date:
-            today()
-
-        });
-
-        saveData(
-          type,
-          data
-        );
-
-        render(type);
-      }
-    );
-
-    renderVarganiTable(type);
+    `;
   }
 
-  // ===================================================
-  // VARGANI TABLE
-  // ===================================================
-
-  function renderVarganiTable(type) {
-
-    const table =
-      document.querySelector(
-        "#varganiTable"
-      );
-
-    if (!table) return;
-
-    const data =
-      getData(type);
-
-    if (!data.length) {
-
-      table.innerHTML = `
-        <tr>
-          <td
-            colspan="8"
-            class="empty"
-          >
-            No records added yet.
-          </td>
-        </tr>
-      `;
-
-      return;
-    }
-
-    table.innerHTML =
-      data.map(
-        (item, index) => `
-
-          <tr>
-
-            <td>
-              ${index + 1}
-            </td>
-
-            <td>
-              <strong>
-                ${escapeHTML(item.name)}
-              </strong>
-            </td>
-
-            <td>
-              ${money(item.total)}
-            </td>
-
-            <td class="paid-text">
-              ${money(item.paid)}
-            </td>
-
-            <td class="remaining-text">
-              ${money(
-                num(item.total) -
-                num(item.paid)
-              )}
-            </td>
-
-            <td class="remarks-cell">
-              ${escapeHTML(
-                item.remarks || "-"
-              )}
-            </td>
-
-            <td>
-              ${item.date || "-"}
-            </td>
-
-            <td>
-
-              <div class="action-buttons">
-
-                <button
-                  class="edit-btn"
-                  data-edit-vargani="${item.id}"
-                  data-type="${type}"
-                >
-                  ✏️
-                </button>
-
-                <button
-                  class="delete-btn"
-                  data-delete-vargani="${item.id}"
-                  data-type="${type}"
-                >
-                  🗑️
-                </button>
-
-              </div>
-
-            </td>
-
-          </tr>
-
-        `
-      ).join("");
-
-
-    // DELETE
-
-    table
-      .querySelectorAll(
-        "[data-delete-vargani]"
-      )
-      .forEach(button => {
-
-        button.addEventListener(
-          "click",
-          () => {
-
-            if (
-              !confirm(
-                "Delete this record?"
-              )
-            ) {
-              return;
-            }
-
-            const id =
-              Number(
-                button.dataset
-                  .deleteVargani
-              );
-
-            const updated =
-              getData(type)
-                .filter(
-                  item =>
-                    item.id !== id
-                );
-
-            saveData(
-              type,
-              updated
-            );
-
-            render(type);
-          }
-        );
-
-      });
-
-
-    // EDIT
-
-    table
-      .querySelectorAll(
-        "[data-edit-vargani]"
-      )
-      .forEach(button => {
-
-        button.addEventListener(
-          "click",
-          () => {
-
-            editVargani(
-              type,
-              Number(
-                button.dataset
-                  .editVargani
-              )
-            );
-
-          }
-        );
-
-      });
-  }
 
   // ===================================================
-  // EDIT VARGANI
+  // COLLECTION FORM
   // ===================================================
 
-  function editVargani(
+  function collectionForm(
     type,
-    id
+    editItem = null
   ) {
 
-    const data =
-      getData(type);
+    const editing =
+      Boolean(editItem);
 
-    const item =
-      data.find(
-        record =>
-          record.id === id
-      );
+    return `
 
-    if (!item) return;
+      <div class="form-card">
 
-    const name =
-      prompt(
-        "Name:",
-        item.name
-      );
+        <div class="form-card-header">
 
-    if (name === null) return;
+          <div>
 
-    const total =
-      prompt(
-        "Total Amount:",
-        item.total
-      );
+            <h3>
+              ${
+                editing
+                  ? "✏️ Edit Entry"
+                  : "➕ Add New Entry"
+              }
+            </h3>
 
-    if (total === null) return;
+            <p>
+              ${
+                collectionTypes[type]
+                  .title
+              }
+            </p>
 
-    const paid =
-      prompt(
-        "Paid / जमा Amount:",
-        item.paid
-      );
+          </div>
 
-    if (paid === null) return;
 
-    const remarks =
-      prompt(
-        "Remarks:",
-        item.remarks || ""
-      );
+          <button
+            type="button"
+            class="close-form"
+            data-action="close-form"
+            data-type="${type}"
+          >
+            ✕
+          </button>
 
-    if (remarks === null) return;
+        </div>
 
-    const newTotal =
-      num(total);
 
-    const newPaid =
-      num(paid);
+        <form
+          id="${type}EntryForm"
+          class="entry-form"
+          data-type="${type}"
+          data-edit-id="${
+            editing
+              ? editItem.id
+              : ""
+          }"
+        >
 
-    if (
-      newTotal <= 0
-    ) {
 
-      alert(
-        "Invalid total amount."
-      );
+          <div class="form-grid">
 
-      return;
-    }
 
-    if (
-      newPaid > newTotal
-    ) {
+            <div class="form-group">
 
-      alert(
-        "Paid cannot be greater than Total."
-      );
+              <label>
+                Name *
+              </label>
 
-      return;
-    }
+              <input
+                type="text"
+                name="name"
+                placeholder="Enter name"
+                value="${
+                  escapeHTML(
+                    editItem?.name || ""
+                  )
+                }"
+                required
+              />
 
-    item.name =
-      name.trim();
+            </div>
 
-    item.total =
-      newTotal;
 
-    item.paid =
-      newPaid;
+            <div class="form-group">
 
-    item.remaining =
-      newTotal - newPaid;
+              <label>
+                Mobile
+              </label>
 
-    item.remarks =
-      remarks.trim();
+              <input
+                type="tel"
+                name="mobile"
+                placeholder="Mobile number"
+                value="${
+                  escapeHTML(
+                    editItem?.mobile || ""
+                  )
+                }"
+              />
 
-    saveData(
-      type,
-      data
-    );
+            </div>
 
-    render(type);
+
+            <div class="form-group">
+
+              <label>
+                Total Amount *
+              </label>
+
+              <input
+                type="number"
+                name="total"
+                min="0"
+                step="1"
+                placeholder="₹ Total"
+                value="${
+                  editItem?.total ?? ""
+                }"
+                required
+              />
+
+            </div>
+
+
+            <div class="form-group">
+
+              <label>
+                Paid / जमा *
+              </label>
+
+              <input
+                type="number"
+                name="paid"
+                min="0"
+                step="1"
+                placeholder="₹ Paid"
+                value="${
+                  editItem?.paid ?? ""
+                }"
+                required
+              />
+
+            </div>
+
+
+            <div class="form-group form-full">
+
+              <label>
+                Remaining / बाकी
+              </label>
+
+              <input
+                type="number"
+                name="remaining"
+                value="${
+                  editItem
+                    ? num(editItem.total) -
+                      num(editItem.paid)
+                    : 0
+                }"
+                readonly
+              />
+
+            </div>
+
+
+            <div class="form-group form-full">
+
+              <label>
+                Remarks
+              </label>
+
+              <textarea
+                name="remarks"
+                rows="3"
+                placeholder="Any remarks..."
+              >${
+                escapeHTML(
+                  editItem?.remarks || ""
+                )
+              }</textarea>
+
+            </div>
+
+
+          </div>
+
+
+          <div class="form-actions">
+
+            <button
+              type="button"
+              class="secondary-button"
+              data-action="close-form"
+              data-type="${type}"
+            >
+              Cancel
+            </button>
+
+
+            <button
+              type="submit"
+              class="primary-button"
+            >
+              ${
+                editing
+                  ? "Update Entry"
+                  : "Save Entry"
+              }
+            </button>
+
+          </div>
+
+
+        </form>
+
+      </div>
+
+    `;
   }
+
 
   // ===================================================
   // BAND / VISARJAN PAGE
   // ===================================================
 
-  function visarjanPage() {
+  function renderVisarjanPage() {
+
+    const data =
+      getData("visarjan");
 
     const summary =
       getVisarjanSummary();
 
+
     return `
-      <section class="page">
 
-        <div class="page-heading">
+      <div class="page-header">
 
-          <button
-            class="back-btn"
-            data-page="home"
-          >
-            ← Home
-          </button>
-
-          <span class="section-tag">
-            🎺 BAND / VISARJAN
-          </span>
+        <div>
 
           <h2>
-            Visarjan Band Booking
+            🎺 Band / Visarjan
           </h2>
 
           <p>
-            Manage Band booking,
-            Total, Paid / जमा and
-            Remaining amount.
+            Band booking स्वतंत्र section
           </p>
 
         </div>
 
 
-        <div class="summary-grid three">
-
-          ${summaryCard(
-            "🎺",
-            "Total Booking",
-            summary.total,
-            `${summary.count} Band bookings`
-          )}
-
-          ${summaryCard(
-            "💵",
-            "Paid / जमा",
-            summary.paid,
-            "Amount paid to Band"
-          )}
-
-          ${summaryCard(
-            "⏳",
-            "Remaining",
-            summary.remaining,
-            "Amount to pay"
-          )}
-
-        </div>
-
-
-        <div class="form-card">
-
-          <div class="form-title">
-
-            <div>
-
-              <span>
-                BAND BOOKING
-              </span>
-
-              <h3>
-                + Add Band Booking
-              </h3>
-
-            </div>
-
-          </div>
-
-
-          <form
-            id="visarjanForm"
-            class="data-form"
-          >
-
-            <div class="form-grid">
-
-              <label>
-
-                <span>
-                  Band Name *
-                </span>
-
-                <input
-                  id="bandName"
-                  type="text"
-                  placeholder="Example: Shivshakti Band"
-                  required
-                />
-
-              </label>
-
-
-              <label>
-
-                <span>
-                  Total Booking Amount *
-                </span>
-
-                <input
-                  id="bandTotal"
-                  type="number"
-                  min="0"
-                  placeholder="₹ Total"
-                  required
-                />
-
-              </label>
-
-
-              <label>
-
-                <span>
-                  Paid / जमा *
-                </span>
-
-                <input
-                  id="bandPaid"
-                  type="number"
-                  min="0"
-                  placeholder="₹ Paid"
-                  required
-                />
-
-              </label>
-
-
-              <label>
-
-                <span>
-                  Remaining
-                </span>
-
-                <input
-                  id="bandRemaining"
-                  type="number"
-                  readonly
-                  value="0"
-                />
-
-              </label>
-
-
-              <label class="full">
-
-                <span>
-                  Remarks
-                </span>
-
-                <textarea
-                  id="bandRemarks"
-                  rows="2"
-                  placeholder="Example: Booking confirmed..."
-                ></textarea>
-
-              </label>
-
-            </div>
-
-
-            <div class="form-actions">
-
-              <button
-                type="submit"
-                class="save-btn"
-              >
-                💾 Save Band Booking
-              </button>
-
-              <button
-                type="reset"
-                class="cancel-btn"
-              >
-                Clear
-              </button>
-
-            </div>
-
-          </form>
-
-        </div>
-
-
-        <div class="table-card">
-
-          <div class="table-heading">
-
-            <div>
-
-              <span>
-                BAND BOOKINGS
-              </span>
-
-              <h3>
-                Band Booking List
-              </h3>
-
-            </div>
-
-            <strong>
-              ${summary.count} Bookings
-            </strong>
-
-          </div>
-
-
-          <div class="table-scroll">
-
-            <table>
-
-              <thead>
-
-                <tr>
-
-                  <th>#</th>
-                  <th>Band Name</th>
-                  <th>Total</th>
-                  <th>Paid / जमा</th>
-                  <th>Remaining</th>
-                  <th>Remarks</th>
-                  <th>Date</th>
-                  <th>Action</th>
-
-                </tr>
-
-              </thead>
-
-
-              <tbody
-                id="visarjanTable"
-              ></tbody>
-
-            </table>
-
-          </div>
-
-        </div>
-
-
-        <div class="card">
-
-          <div class="overview-top">
-
-            <div class="overview-icon">
-              ℹ️
-            </div>
-
-            <div>
-
-              <span>
-                Band Accounting
-              </span>
-
-              <p>
-                Band चे Total Vargani मध्ये
-                add होत नाही. Band ला दिलेली
-                Paid / जमा रक्कम मात्र
-                हातातील रकमेतून deduct होते.
-              </p>
-
-            </div>
-
-          </div>
-
-        </div>
-
-      </section>
-    `;
-  }
-
-  // ===================================================
-  // SETUP BAND
-  // ===================================================
-
-  function setupVisarjan() {
-
-    const form =
-      document.querySelector(
-        "#visarjanForm"
-      );
-
-    if (!form) return;
-
-    const total =
-      document.querySelector(
-        "#bandTotal"
-      );
-
-    const paid =
-      document.querySelector(
-        "#bandPaid"
-      );
-
-    const remaining =
-      document.querySelector(
-        "#bandRemaining"
-      );
-
-    function calculate() {
-
-      remaining.value =
-        Math.max(
-          0,
-          num(total.value) -
-          num(paid.value)
-        );
-    }
-
-    total.addEventListener(
-      "input",
-      calculate
-    );
-
-    paid.addEventListener(
-      "input",
-      calculate
-    );
-
-
-    form.addEventListener(
-      "submit",
-      event => {
-
-        event.preventDefault();
-
-        const name =
-          document
-            .querySelector(
-              "#bandName"
-            )
-            .value
-            .trim();
-
-        const totalAmount =
-          num(total.value);
-
-        const paidAmount =
-          num(paid.value);
-
-        const remarks =
-          document
-            .querySelector(
-              "#bandRemarks"
-            )
-            .value
-            .trim();
-
-        if (
-          !name ||
-          totalAmount <= 0
-        ) {
-
-          alert(
-            "Please enter Band Name and Total."
-          );
-
-          return;
-        }
-
-        if (
-          paidAmount >
-          totalAmount
-        ) {
-
-          alert(
-            "Paid cannot be greater than Total."
-          );
-
-          return;
-        }
-
-        const data =
-          getData("visarjan");
-
-        data.push({
-
-          id: Date.now(),
-
-          name,
-
-          total:
-            totalAmount,
-
-          // IMPORTANT:
-          // Band Paid is stored separately.
-          paid:
-            paidAmount,
-
-          remaining:
-            totalAmount -
-            paidAmount,
-
-          remarks,
-
-          date:
-            today()
-
-        });
-
-        saveData(
-          "visarjan",
-          data
-        );
-
-        render("visarjan");
-      }
-    );
-
-    renderVisarjanTable();
-  }
-
-  // ===================================================
-  // BAND TABLE
-  // ===================================================
-
-  function renderVisarjanTable() {
-
-    const table =
-      document.querySelector(
-        "#visarjanTable"
-      );
-
-    if (!table) return;
-
-    const data =
-      getData("visarjan");
-
-    if (!data.length) {
-
-      table.innerHTML = `
-        <tr>
-
-          <td
-            colspan="8"
-            class="empty"
-          >
-            No Band bookings added yet.
-          </td>
-
-        </tr>
-      `;
-
-      return;
-    }
-
-    table.innerHTML =
-      data.map(
-        (item, index) => {
-
-          const paid =
-            getBandPaid(item);
-
-          const remaining =
-            Math.max(
-              0,
-              num(item.total) -
-              paid
-            );
-
-          return `
-
-            <tr>
-
-              <td>
-                ${index + 1}
-              </td>
-
-              <td>
-                <strong>
-                  ${escapeHTML(
-                    item.name
-                  )}
-                </strong>
-              </td>
-
-              <td>
-                ${money(
-                  item.total
-                )}
-              </td>
-
-              <td class="paid-text">
-                ${money(paid)}
-              </td>
-
-              <td class="remaining-text">
-                ${money(
-                  remaining
-                )}
-              </td>
-
-              <td class="remarks-cell">
-                ${escapeHTML(
-                  item.remarks || "-"
-                )}
-              </td>
-
-              <td>
-                ${item.date || "-"}
-              </td>
-
-              <td>
-
-                <div class="action-buttons">
-
-                  <button
-                    class="edit-btn"
-                    data-edit-band="${item.id}"
-                  >
-                    ✏️
-                  </button>
-
-                  <button
-                    class="delete-btn"
-                    data-delete-band="${item.id}"
-                  >
-                    🗑️
-                  </button>
-
-                </div>
-
-              </td>
-
-            </tr>
-
-          `;
-        }
-      ).join("");
-
-
-    // DELETE BAND
-
-    table
-      .querySelectorAll(
-        "[data-delete-band]"
-      )
-      .forEach(button => {
-
-        button.addEventListener(
-          "click",
-          () => {
-
-            if (
-              !confirm(
-                "Delete this Band booking?"
-              )
-            ) {
-              return;
-            }
-
-            const id =
-              Number(
-                button.dataset
-                  .deleteBand
-              );
-
-            const updated =
-              getData("visarjan")
-                .filter(
-                  item =>
-                    item.id !== id
-                );
-
-            saveData(
-              "visarjan",
-              updated
-            );
-
-            render("visarjan");
-          }
-        );
-
-      });
-
-
-    // EDIT BAND
-
-    table
-      .querySelectorAll(
-        "[data-edit-band]"
-      )
-      .forEach(button => {
-
-        button.addEventListener(
-          "click",
-          () => {
-
-            editBand(
-              Number(
-                button.dataset
-                  .editBand
-              )
-            );
-
-          }
-        );
-
-      });
-  }
-
-  // ===================================================
-  // EDIT BAND
-  // ===================================================
-
-  function editBand(id) {
-
-    const data =
-      getData("visarjan");
-
-    const item =
-      data.find(
-        record =>
-          record.id === id
-      );
-
-    if (!item) return;
-
-    const currentPaid =
-      getBandPaid(item);
-
-    const name =
-      prompt(
-        "Band Name:",
-        item.name
-      );
-
-    if (name === null) return;
-
-    const total =
-      prompt(
-        "Total Booking Amount:",
-        item.total
-      );
-
-    if (total === null) return;
-
-    const paid =
-      prompt(
-        "Paid / जमा Amount:",
-        currentPaid
-      );
-
-    if (paid === null) return;
-
-    const remarks =
-      prompt(
-        "Remarks:",
-        item.remarks || ""
-      );
-
-    if (remarks === null) return;
-
-    const newTotal =
-      num(total);
-
-    const newPaid =
-      num(paid);
-
-    if (
-      newTotal <= 0
-    ) {
-
-      alert(
-        "Invalid Total amount."
-      );
-
-      return;
-    }
-
-    if (
-      newPaid > newTotal
-    ) {
-
-      alert(
-        "Paid cannot be greater than Total."
-      );
-
-      return;
-    }
-
-    item.name =
-      name.trim();
-
-    item.total =
-      newTotal;
-
-    item.paid =
-      newPaid;
-
-    item.remaining =
-      newTotal - newPaid;
-
-    item.remarks =
-      remarks.trim();
-
-    saveData(
-      "visarjan",
-      data
-    );
-
-    render("visarjan");
-  }
-
-  // ===================================================
-  // HAAT KARACH / EXPENSE PAGE
-  // ===================================================
-
-  function expensesPage() {
-
-    const summary =
-      getExpenseSummary();
-
-    return `
-      <section class="page">
-
-        <div class="page-heading">
-
-          <button
-            class="back-btn"
-            data-page="home"
-          >
-            ← Home
-          </button>
-
-          <span class="section-tag">
-            💸 HAAT KARACH
-          </span>
-
-          <h2>
-            खर्च
-          </h2>
-
-          <p>
-            Manage Haat Karach,
-            Total, Paid / जमा and
-            Remaining amount.
-          </p>
-
-        </div>
-
-
-        <div class="summary-grid three">
-
-          ${summaryCard(
-            "💰",
-            "Total खर्च",
-            summary.total,
-            `${summary.count} records`
-          )}
-
-          ${summaryCard(
-            "✅",
-            "Paid / जमा",
-            summary.paid,
-            "Amount paid"
-          )}
-
-          ${summaryCard(
-            "⏳",
-            "Remaining",
-            summary.remaining,
-            "Expense pending"
-          )}
-
-        </div>
-
-
-        <div class="form-card">
-
-          <div class="form-title">
-
-            <div>
-
-              <span>
-                HAAT KARACH
-              </span>
-
-              <h3>
-                + Add खर्च
-              </h3>
-
-            </div>
-
-          </div>
-
-
-          <form
-            id="expenseForm"
-            class="data-form"
-          >
-
-            <div class="form-grid">
-
-              <label>
-
-                <span>
-                  Expense Name *
-                </span>
-
-                <input
-                  id="expenseName"
-                  type="text"
-                  placeholder="Decoration / Sound / Mandap..."
-                  required
-                />
-
-              </label>
-
-
-              <label>
-
-                <span>
-                  Total Amount *
-                </span>
-
-                <input
-                  id="expenseTotal"
-                  type="number"
-                  min="0"
-                  placeholder="₹ Total"
-                  required
-                />
-
-              </label>
-
-
-              <label>
-
-                <span>
-                  Paid / जमा *
-                </span>
-
-                <input
-                  id="expensePaid"
-                  type="number"
-                  min="0"
-                  placeholder="₹ Paid"
-                  required
-                />
-
-              </label>
-
-
-              <label>
-
-                <span>
-                  Remaining
-                </span>
-
-                <input
-                  id="expenseRemaining"
-                  type="number"
-                  readonly
-                  value="0"
-                />
-
-              </label>
-
-
-              <label class="full">
-
-                <span>
-                  Remarks
-                </span>
-
-                <textarea
-                  id="expenseRemarks"
-                  rows="2"
-                  placeholder="Enter expense remarks..."
-                ></textarea>
-
-              </label>
-
-            </div>
-
-
-            <div class="form-actions">
-
-              <button
-                type="submit"
-                class="save-btn"
-              >
-                💾 Save खर्च
-              </button>
-
-              <button
-                type="reset"
-                class="cancel-btn"
-              >
-                Clear
-              </button>
-
-            </div>
-
-          </form>
-
-        </div>
-
-
-        <div class="table-card">
-
-          <div class="table-heading">
-
-            <div>
-
-              <span>
-                EXPENSE LIST
-              </span>
-
-              <h3>
-                Haat Karach Records
-              </h3>
-
-            </div>
-
-            <strong>
-              ${summary.count} Records
-            </strong>
-
-          </div>
-
-
-          <div class="table-scroll">
-
-            <table>
-
-              <thead>
-
-                <tr>
-
-                  <th>#</th>
-                  <th>Expense</th>
-                  <th>Total</th>
-                  <th>Paid / जमा</th>
-                  <th>Remaining</th>
-                  <th>Remarks</th>
-                  <th>Date</th>
-                  <th>Action</th>
-
-                </tr>
-
-              </thead>
-
-
-              <tbody
-                id="expenseTable"
-              ></tbody>
-
-            </table>
-
-          </div>
-
-        </div>
-
-      </section>
-    `;
-  }
-
-  // ===================================================
-  // SETUP EXPENSES
-  // ===================================================
-
-  function setupExpenses() {
-
-    const form =
-      document.querySelector(
-        "#expenseForm"
-      );
-
-    if (!form) return;
-
-    const total =
-      document.querySelector(
-        "#expenseTotal"
-      );
-
-    const paid =
-      document.querySelector(
-        "#expensePaid"
-      );
-
-    const remaining =
-      document.querySelector(
-        "#expenseRemaining"
-      );
-
-    function calculate() {
-
-      remaining.value =
-        Math.max(
-          0,
-          num(total.value) -
-          num(paid.value)
-        );
-    }
-
-    total.addEventListener(
-      "input",
-      calculate
-    );
-
-    paid.addEventListener(
-      "input",
-      calculate
-    );
-
-
-    form.addEventListener(
-      "submit",
-      event => {
-
-        event.preventDefault();
-
-        const name =
-          document
-            .querySelector(
-              "#expenseName"
-            )
-            .value
-            .trim();
-
-        const totalAmount =
-          num(total.value);
-
-        const paidAmount =
-          num(paid.value);
-
-        const remarks =
-          document
-            .querySelector(
-              "#expenseRemarks"
-            )
-            .value
-            .trim();
-
-        if (
-          !name ||
-          totalAmount <= 0
-        ) {
-
-          alert(
-            "Please enter Expense and Total."
-          );
-
-          return;
-        }
-
-        if (
-          paidAmount >
-          totalAmount
-        ) {
-
-          alert(
-            "Paid cannot be greater than Total."
-          );
-
-          return;
-        }
-
-        const data =
-          getData("expenses");
-
-        data.push({
-
-          id: Date.now(),
-
-          name,
-
-          total:
-            totalAmount,
-
-          paid:
-            paidAmount,
-
-          remaining:
-            totalAmount -
-            paidAmount,
-
-          remarks,
-
-          date:
-            today()
-
-        });
-
-        saveData(
-          "expenses",
-          data
-        );
-
-        render("expenses");
-      }
-    );
-
-    renderExpenseTable();
-  }
-
-  // ===================================================
-  // EXPENSE TABLE
-  // ===================================================
-
-  function renderExpenseTable() {
-
-    const table =
-      document.querySelector(
-        "#expenseTable"
-      );
-
-    if (!table) return;
-
-    const data =
-      getData("expenses");
-
-    if (!data.length) {
-
-      table.innerHTML = `
-        <tr>
-
-          <td
-            colspan="8"
-            class="empty"
-          >
-            No expenses added yet.
-          </td>
-
-        </tr>
-      `;
-
-      return;
-    }
-
-    table.innerHTML =
-      data.map(
-        (item, index) => `
-
-          <tr>
-
-            <td>
-              ${index + 1}
-            </td>
-
-            <td>
-              <strong>
-                ${escapeHTML(
-                  item.name
-                )}
-              </strong>
-            </td>
-
-            <td>
-              ${money(
-                item.total
-              )}
-            </td>
-
-            <td class="paid-text">
-              ${money(
-                item.paid
-              )}
-            </td>
-
-            <td class="remaining-text">
-              ${money(
-                num(item.total) -
-                num(item.paid)
-              )}
-            </td>
-
-            <td class="remarks-cell">
-              ${escapeHTML(
-                item.remarks || "-"
-              )}
-            </td>
-
-            <td>
-              ${item.date || "-"}
-            </td>
-
-            <td>
-
-              <div class="action-buttons">
-
-                <button
-                  class="edit-btn"
-                  data-edit-expense="${item.id}"
-                >
-                  ✏️
-                </button>
-
-                <button
-                  class="delete-btn"
-                  data-delete-expense="${item.id}"
-                >
-                  🗑️
-                </button>
-
-              </div>
-
-            </td>
-
-          </tr>
-
-        `
-      ).join("");
-
-
-    // DELETE
-
-    table
-      .querySelectorAll(
-        "[data-delete-expense]"
-      )
-      .forEach(button => {
-
-        button.addEventListener(
-          "click",
-          () => {
-
-            if (
-              !confirm(
-                "Delete this expense?"
-              )
-            ) {
-              return;
-            }
-
-            const id =
-              Number(
-                button.dataset
-                  .deleteExpense
-              );
-
-            const updated =
-              getData("expenses")
-                .filter(
-                  item =>
-                    item.id !== id
-                );
-
-            saveData(
-              "expenses",
-              updated
-            );
-
-            render("expenses");
-          }
-        );
-
-      });
-
-
-    // EDIT
-
-    table
-      .querySelectorAll(
-        "[data-edit-expense]"
-      )
-      .forEach(button => {
-
-        button.addEventListener(
-          "click",
-          () => {
-
-            editExpense(
-              Number(
-                button.dataset
-                  .editExpense
-              )
-            );
-
-          }
-        );
-
-      });
-  }
-
-  // ===================================================
-  // EDIT EXPENSE
-  // ===================================================
-
-  function editExpense(id) {
-
-    const data =
-      getData("expenses");
-
-    const item =
-      data.find(
-        record =>
-          record.id === id
-      );
-
-    if (!item) return;
-
-    const name =
-      prompt(
-        "Expense Name:",
-        item.name
-      );
-
-    if (name === null) return;
-
-    const total =
-      prompt(
-        "Total Amount:",
-        item.total
-      );
-
-    if (total === null) return;
-
-    const paid =
-      prompt(
-        "Paid / जमा Amount:",
-        item.paid
-      );
-
-    if (paid === null) return;
-
-    const remarks =
-      prompt(
-        "Remarks:",
-        item.remarks || ""
-      );
-
-    if (remarks === null) return;
-
-    const newTotal =
-      num(total);
-
-    const newPaid =
-      num(paid);
-
-    if (
-      newTotal <= 0 ||
-      newPaid > newTotal
-    ) {
-
-      alert(
-        "Invalid amount."
-      );
-
-      return;
-    }
-
-    item.name =
-      name.trim();
-
-    item.total =
-      newTotal;
-
-    item.paid =
-      newPaid;
-
-    item.remaining =
-      newTotal - newPaid;
-
-    item.remarks =
-      remarks.trim();
-
-    saveData(
-      "expenses",
-      data
-    );
-
-    render("expenses");
-  }
-
-  // ===================================================
-  // REPORT PAGE
-  // ===================================================
-
-  function reportPage() {
-
-    const overall =
-      getOverallSummary();
-
-    return `
-      <section class="page report-page">
-
-        <div class="page-heading">
-
-          <button
-            class="back-btn"
-            data-page="home"
-          >
-            ← Home
-          </button>
-
-          <span class="section-tag">
-            📊 COMPLETE REPORT
-          </span>
-
-          <h2>
-            जमा-खर्च
-          </h2>
-
-          <p>
-            Complete Ganpati Mandal account
-            for ${selectedYear}.
-          </p>
-
-        </div>
-
-
-        <div class="report-actions">
-
-          <button
-            id="printReport"
-            class="primary-btn"
-          >
-            📄 Print / Save PDF
-          </button>
-
-        </div>
-
-
-        <div
-          id="printArea"
-          class="report-document"
+        <button
+          type="button"
+          class="primary-button"
+          data-action="add-band"
         >
+          + Add Band
+        </button>
 
-          <div class="report-header">
-
-            <div>
-
-              <span>
-                GANPATI MANDAL ACCOUNTS
-              </span>
-
-              <h2>
-                जमा-खर्च अहवाल
-              </h2>
-
-              <p>
-                Accounting Year
-                ${selectedYear}
-              </p>
-
-            </div>
-
-            <div class="report-diya">
-              🪔
-            </div>
-
-          </div>
+      </div>
 
 
-          <div class="report-summary">
+      <div class="summary-grid">
 
-            <div>
-              <span>
-                Total Vargani
-              </span>
+        ${summaryCard(
+          "🎺",
+          "Band Total",
+          summary.total,
+          summary.paid,
+          summary.remaining
+        )}
 
-              <strong>
-                ${money(
-                  overall.collectionTotal
-                )}
-              </strong>
-            </div>
+        ${smallStatCard(
+          "Paid / जमा",
+          summary.paid,
+          "💵"
+        )}
 
+        ${smallStatCard(
+          "Remaining / बाकी",
+          summary.remaining,
+          "⏳"
+        )}
 
-            <div>
-              <span>
-                Vargani Paid
-              </span>
+        ${smallStatCard(
+          "Band Entries",
+          summary.count,
+          "📋",
+          true
+        )}
 
-              <strong>
-                ${money(
-                  overall.collectionPaid
-                )}
-              </strong>
-            </div>
-
-
-            <div>
-              <span>
-                Vargani Remaining
-              </span>
-
-              <strong>
-                ${money(
-                  overall.collectionRemaining
-                )}
-              </strong>
-            </div>
+      </div>
 
 
-            <div>
-              <span>
-                Total Haat Karach
-              </span>
-
-              <strong>
-                ${money(
-                  overall.expenseTotal
-                )}
-              </strong>
-            </div>
+      <div id="visarjanFormContainer"></div>
 
 
-            <div>
-              <span>
-                Haat Karach Paid
-              </span>
+      <div class="table-card">
 
-              <strong>
-                ${money(
-                  overall.expensePaid
-                )}
-              </strong>
-            </div>
-
-
-            <div>
-              <span>
-                Band Total
-              </span>
-
-              <strong>
-                ${money(
-                  overall.visarjanTotal
-                )}
-              </strong>
-            </div>
-
-
-            <div>
-              <span>
-                Band Paid
-              </span>
-
-              <strong>
-                ${money(
-                  overall.visarjanAdvance
-                )}
-              </strong>
-            </div>
-
-
-            <div>
-              <span>
-                हातातील रक्कम
-              </span>
-
-              <strong>
-                ${money(
-                  overall.cashInHand
-                )}
-              </strong>
-            </div>
-
-          </div>
-
-
-          ${reportSection(
-            "👦 Boys Vargani",
-            getData("boys"),
-            "vargani"
-          )}
-
-
-          ${reportSection(
-            "⭐ Main Vargani",
-            getData("main"),
-            "vargani"
-          )}
-
-
-          ${reportSection(
-            "👨‍👩‍👧 Family Vargani",
-            getData("family"),
-            "vargani"
-          )}
-
-
-          ${reportSection(
-            "🎺 Band / Visarjan Booking",
-            getData("visarjan"),
-            "visarjan"
-          )}
-
-
-          ${reportSection(
-            "💸 Haat Karach / खर्च",
-            getData("expenses"),
-            "expense"
-          )}
-
-
-          <div class="report-footer">
-            🙏 गणपती बाप्पा मोरया 🙏
-          </div>
-
-        </div>
-
-      </section>
-    `;
-  }
-
-  // ===================================================
-  // REPORT SECTION
-  // ===================================================
-
-  function reportSection(
-    title,
-    data,
-    type
-  ) {
-
-    let total = 0;
-
-    let paid = 0;
-
-    data.forEach(item => {
-
-      total +=
-        num(item.total);
-
-      paid +=
-        type === "visarjan"
-          ? getBandPaid(item)
-          : num(item.paid);
-
-    });
-
-
-    return `
-      <div class="report-section">
-
-        <div class="report-section-head">
-
-          <h3>
-            ${title}
-          </h3>
+        <div class="table-card-header">
 
           <div>
 
-            Total:
+            <h3>
+              Band Bookings
+            </h3>
+
+            <p>
+              Band money is kept separate from Vargani.
+            </p>
+
+          </div>
+
+
+          <div class="table-total">
+
+            <span>
+              Band Total
+            </span>
+
             <strong>
-              ${money(total)}
-            </strong>
-
-            &nbsp; | &nbsp;
-
-            Paid:
-            <strong>
-              ${money(paid)}
-            </strong>
-
-            &nbsp; | &nbsp;
-
-            Remaining:
-            <strong>
-              ${money(
-                Math.max(
-                  0,
-                  total - paid
-                )
-              )}
+              ${money(summary.total)}
             </strong>
 
           </div>
@@ -3726,145 +1667,3842 @@ export function setupApp(element) {
 
         ${
           data.length
-
-            ? `
-
-              <div class="report-table">
-
-                <table>
-
-                  <thead>
-
-                    <tr>
-
-                      <th>
-                        Name
-                      </th>
-
-                      <th>
-                        Total
-                      </th>
-
-                      <th>
-                        Paid / जमा
-                      </th>
-
-                      <th>
-                        Remaining
-                      </th>
-
-                      <th>
-                        Remarks
-                      </th>
-
-                    </tr>
-
-                  </thead>
-
-
-                  <tbody>
-
-                    ${
-                      data.map(
-                        item => {
-
-                          const itemPaid =
-                            type === "visarjan"
-                              ? getBandPaid(item)
-                              : num(item.paid);
-
-                          return `
-
-                            <tr>
-
-                              <td>
-                                ${escapeHTML(
-                                  item.name
-                                )}
-                              </td>
-
-                              <td>
-                                ${money(
-                                  item.total
-                                )}
-                              </td>
-
-                              <td>
-                                ${money(
-                                  itemPaid
-                                )}
-                              </td>
-
-                              <td>
-                                ${money(
-                                  Math.max(
-                                    0,
-                                    num(item.total) -
-                                    itemPaid
-                                  )
-                                )}
-                              </td>
-
-                              <td>
-                                ${escapeHTML(
-                                  item.remarks || "-"
-                                )}
-                              </td>
-
-                            </tr>
-
-                          `;
-                        }
-                      ).join("")
-                    }
-
-                  </tbody>
-
-                </table>
-
-              </div>
-
-            `
-
-            : `
-
-              <div class="empty-report">
-                No records.
-              </div>
-
-            `
+            ? bandTable(data)
+            : emptyTable(
+                "Band / Visarjan"
+              )
         }
 
       </div>
+
     `;
   }
 
+
   // ===================================================
-  // REPORT SETUP
+  // BAND TABLE
   // ===================================================
 
-  function setupReport() {
+  function bandTable(data) {
 
-    const button =
-      document.querySelector(
-        "#printReport"
+    return `
+
+      <div class="table-responsive">
+
+        <table class="data-table">
+
+          <thead>
+
+            <tr>
+
+              <th>#</th>
+
+              <th>Band Name</th>
+
+              <th>Total</th>
+
+              <th>Paid / जमा</th>
+
+              <th>Remaining / बाकी</th>
+
+              <th>Remarks</th>
+
+              <th>Actions</th>
+
+            </tr>
+
+          </thead>
+
+
+          <tbody>
+
+            ${data.map((item, index) => {
+
+              const total =
+                num(item.total);
+
+              const paid =
+                getBandPaid(item);
+
+              const remaining =
+                total - paid;
+
+
+              return `
+
+                <tr>
+
+                  <td>
+                    ${index + 1}
+                  </td>
+
+
+                  <td>
+
+                    <div class="person-cell">
+
+                      <div class="person-avatar">
+                        🎺
+                      </div>
+
+                      <strong>
+                        ${escapeHTML(
+                          item.bandName ||
+                          item.name ||
+                          ""
+                        )}
+                      </strong>
+
+                    </div>
+
+                  </td>
+
+
+                  <td>
+                    <strong>
+                      ${money(total)}
+                    </strong>
+                  </td>
+
+
+                  <td>
+                    <span class="paid-badge">
+                      ${money(paid)}
+                    </span>
+                  </td>
+
+
+                  <td>
+
+                    <span class="${
+                      remaining > 0
+                        ? "remaining-badge"
+                        : "paid-full-badge"
+                    }">
+
+                      ${money(remaining)}
+
+                    </span>
+
+                  </td>
+
+
+                  <td>
+
+                    <span class="remarks-text">
+                      ${escapeHTML(
+                        item.remarks || "-"
+                      )}
+                    </span>
+
+                  </td>
+
+
+                  <td>
+
+                    <div class="table-actions">
+
+                      <button
+                        type="button"
+                        class="icon-button edit"
+                        data-action="edit-band"
+                        data-id="${item.id}"
+                        title="Edit"
+                      >
+                        ✏️
+                      </button>
+
+
+                      <button
+                        type="button"
+                        class="icon-button delete"
+                        data-action="delete-band"
+                        data-id="${item.id}"
+                        title="Delete"
+                      >
+                        🗑️
+                      </button>
+
+                    </div>
+
+                  </td>
+
+                </tr>
+
+              `;
+
+            }).join("")}
+
+          </tbody>
+
+        </table>
+
+      </div>
+
+    `;
+  }
+
+
+  // ===================================================
+  // BAND FORM
+  // ===================================================
+
+  function bandForm(editItem = null) {
+
+    const editing =
+      Boolean(editItem);
+
+    const paid =
+      editing
+        ? getBandPaid(editItem)
+        : 0;
+
+
+    return `
+
+      <div class="form-card">
+
+        <div class="form-card-header">
+
+          <div>
+
+            <h3>
+              ${
+                editing
+                  ? "✏️ Edit Band"
+                  : "➕ Add Band Booking"
+              }
+            </h3>
+
+            <p>
+              Band booking details
+            </p>
+
+          </div>
+
+
+          <button
+            type="button"
+            class="close-form"
+            data-action="close-band-form"
+          >
+            ✕
+          </button>
+
+        </div>
+
+
+        <form
+          id="bandEntryForm"
+          class="entry-form"
+          data-edit-id="${
+            editing
+              ? editItem.id
+              : ""
+          }"
+        >
+
+
+          <div class="form-grid">
+
+
+            <div class="form-group">
+
+              <label>
+                Band Name *
+              </label>
+
+              <input
+                type="text"
+                name="bandName"
+                placeholder="Enter Band Name"
+                value="${
+                  escapeHTML(
+                    editItem?.bandName ||
+                    editItem?.name ||
+                    ""
+                  )
+                }"
+                required
+              />
+
+            </div>
+
+
+            <div class="form-group">
+
+              <label>
+                Total Amount *
+              </label>
+
+              <input
+                type="number"
+                name="total"
+                min="0"
+                step="1"
+                placeholder="₹ Total"
+                value="${
+                  editItem?.total ?? ""
+                }"
+                required
+              />
+
+            </div>
+
+
+            <div class="form-group">
+
+              <label>
+                Paid / जमा
+              </label>
+
+              <input
+                type="number"
+                name="paid"
+                min="0"
+                step="1"
+                placeholder="₹ Paid"
+                value="${
+                  editing ? paid : ""
+                }"
+              />
+
+            </div>
+
+
+            <div class="form-group">
+
+              <label>
+                Remaining / बाकी
+              </label>
+
+              <input
+                type="number"
+                name="remaining"
+                value="${
+                  editing
+                    ? num(editItem.total) -
+                      paid
+                    : 0
+                }"
+                readonly
+              />
+
+            </div>
+
+
+            <div class="form-group form-full">
+
+              <label>
+                Remarks
+              </label>
+
+              <textarea
+                name="remarks"
+                rows="3"
+                placeholder="Band booking remarks..."
+              >${
+                escapeHTML(
+                  editItem?.remarks || ""
+                )
+              }</textarea>
+
+            </div>
+
+
+          </div>
+
+
+          <div class="form-actions">
+
+            <button
+              type="button"
+              class="secondary-button"
+              data-action="close-band-form"
+            >
+              Cancel
+            </button>
+
+
+            <button
+              type="submit"
+              class="primary-button"
+            >
+              ${
+                editing
+                  ? "Update Band"
+                  : "Save Band"
+              }
+            </button>
+
+          </div>
+
+
+        </form>
+
+      </div>
+
+    `;
+  }  // ===================================================
+  // HAAT KARACH / EXPENSES PAGE
+  // ===================================================
+
+  function renderExpensesPage() {
+
+    const data =
+      getData("expenses");
+
+    const summary =
+      getExpenseSummary();
+
+
+    return `
+
+      <div class="page-header">
+
+        <div>
+
+          <h2>
+            💸 Haat Karach / खर्च
+          </h2>
+
+          <p>
+            मंडळाचे सर्व खर्च स्वतंत्र नोंदवा
+          </p>
+
+        </div>
+
+
+        <button
+          type="button"
+          class="primary-button"
+          data-action="add-expense"
+        >
+          + Add Expense
+        </button>
+
+      </div>
+
+
+      <div class="summary-grid">
+
+        ${summaryCard(
+          "💸",
+          "Expense Total",
+          summary.total,
+          summary.paid,
+          summary.remaining
+        )}
+
+        ${smallStatCard(
+          "Paid / जमा",
+          summary.paid,
+          "💵"
+        )}
+
+        ${smallStatCard(
+          "Remaining / बाकी",
+          summary.remaining,
+          "⏳"
+        )}
+
+        ${smallStatCard(
+          "Expenses",
+          summary.count,
+          "📋",
+          true
+        )}
+
+      </div>
+
+
+      <div id="expensesFormContainer"></div>
+
+
+      <div class="table-card">
+
+        <div class="table-card-header">
+
+          <div>
+
+            <h3>
+              Haat Karach Entries
+            </h3>
+
+            <p>
+              खर्चाच्या सर्व नोंदी
+            </p>
+
+          </div>
+
+
+          <div class="table-total">
+
+            <span>
+              Total Expense
+            </span>
+
+            <strong>
+              ${money(summary.total)}
+            </strong>
+
+          </div>
+
+        </div>
+
+
+        ${
+          data.length
+            ? expenseTable(data)
+            : emptyTable(
+                "Haat Karach / खर्च"
+              )
+        }
+
+      </div>
+
+    `;
+  }
+
+
+  // ===================================================
+  // EXPENSE TABLE
+  // ===================================================
+
+  function expenseTable(data) {
+
+    return `
+
+      <div class="table-responsive">
+
+        <table class="data-table">
+
+          <thead>
+
+            <tr>
+
+              <th>#</th>
+
+              <th>Expense Name</th>
+
+              <th>Total</th>
+
+              <th>Paid / जमा</th>
+
+              <th>Remaining / बाकी</th>
+
+              <th>Remarks</th>
+
+              <th>Actions</th>
+
+            </tr>
+
+          </thead>
+
+
+          <tbody>
+
+            ${data.map((item, index) => {
+
+              const total =
+                num(item.total);
+
+              const paid =
+                num(item.paid);
+
+              const remaining =
+                total - paid;
+
+
+              return `
+
+                <tr>
+
+                  <td>
+                    ${index + 1}
+                  </td>
+
+
+                  <td>
+
+                    <div class="person-cell">
+
+                      <div class="person-avatar">
+                        💸
+                      </div>
+
+                      <strong>
+                        ${escapeHTML(
+                          item.title ||
+                          item.name ||
+                          ""
+                        )}
+                      </strong>
+
+                    </div>
+
+                  </td>
+
+
+                  <td>
+                    <strong>
+                      ${money(total)}
+                    </strong>
+                  </td>
+
+
+                  <td>
+                    <span class="paid-badge">
+                      ${money(paid)}
+                    </span>
+                  </td>
+
+
+                  <td>
+
+                    <span class="${
+                      remaining > 0
+                        ? "remaining-badge"
+                        : "paid-full-badge"
+                    }">
+
+                      ${money(remaining)}
+
+                    </span>
+
+                  </td>
+
+
+                  <td>
+
+                    <span class="remarks-text">
+                      ${escapeHTML(
+                        item.remarks || "-"
+                      )}
+                    </span>
+
+                  </td>
+
+
+                  <td>
+
+                    <div class="table-actions">
+
+                      <button
+                        type="button"
+                        class="icon-button edit"
+                        data-action="edit-expense"
+                        data-id="${item.id}"
+                        title="Edit"
+                      >
+                        ✏️
+                      </button>
+
+
+                      <button
+                        type="button"
+                        class="icon-button delete"
+                        data-action="delete-expense"
+                        data-id="${item.id}"
+                        title="Delete"
+                      >
+                        🗑️
+                      </button>
+
+                    </div>
+
+                  </td>
+
+                </tr>
+
+              `;
+
+            }).join("")}
+
+          </tbody>
+
+        </table>
+
+      </div>
+
+    `;
+  }
+
+
+  // ===================================================
+  // EXPENSE FORM
+  // ===================================================
+
+  function expenseForm(editItem = null) {
+
+    const editing =
+      Boolean(editItem);
+
+
+    return `
+
+      <div class="form-card">
+
+        <div class="form-card-header">
+
+          <div>
+
+            <h3>
+              ${
+                editing
+                  ? "✏️ Edit Expense"
+                  : "➕ Add Expense"
+              }
+            </h3>
+
+            <p>
+              Haat Karach / खर्च
+            </p>
+
+          </div>
+
+
+          <button
+            type="button"
+            class="close-form"
+            data-action="close-expense-form"
+          >
+            ✕
+          </button>
+
+        </div>
+
+
+        <form
+          id="expenseEntryForm"
+          class="entry-form"
+          data-edit-id="${
+            editing
+              ? editItem.id
+              : ""
+          }"
+        >
+
+
+          <div class="form-grid">
+
+
+            <div class="form-group">
+
+              <label>
+                Expense Name *
+              </label>
+
+              <input
+                type="text"
+                name="title"
+                placeholder="उदा. Decoration, Light, Sound..."
+                value="${
+                  escapeHTML(
+                    editItem?.title ||
+                    editItem?.name ||
+                    ""
+                  )
+                }"
+                required
+              />
+
+            </div>
+
+
+            <div class="form-group">
+
+              <label>
+                Total Amount *
+              </label>
+
+              <input
+                type="number"
+                name="total"
+                min="0"
+                step="1"
+                placeholder="₹ Total"
+                value="${
+                  editItem?.total ?? ""
+                }"
+                required
+              />
+
+            </div>
+
+
+            <div class="form-group">
+
+              <label>
+                Paid / जमा
+              </label>
+
+              <input
+                type="number"
+                name="paid"
+                min="0"
+                step="1"
+                placeholder="₹ Paid"
+                value="${
+                  editItem?.paid ?? ""
+                }"
+              />
+
+            </div>
+
+
+            <div class="form-group">
+
+              <label>
+                Remaining / बाकी
+              </label>
+
+              <input
+                type="number"
+                name="remaining"
+                value="${
+                  editing
+                    ? num(editItem.total) -
+                      num(editItem.paid)
+                    : 0
+                }"
+                readonly
+              />
+
+            </div>
+
+
+            <div class="form-group form-full">
+
+              <label>
+                Remarks
+              </label>
+
+              <textarea
+                name="remarks"
+                rows="3"
+                placeholder="खर्चाबद्दल काही remarks..."
+              >${
+                escapeHTML(
+                  editItem?.remarks || ""
+                )
+              }</textarea>
+
+            </div>
+
+
+          </div>
+
+
+          <div class="form-actions">
+
+            <button
+              type="button"
+              class="secondary-button"
+              data-action="close-expense-form"
+            >
+              Cancel
+            </button>
+
+
+            <button
+              type="submit"
+              class="primary-button"
+            >
+              ${
+                editing
+                  ? "Update Expense"
+                  : "Save Expense"
+              }
+            </button>
+
+          </div>
+
+
+        </form>
+
+      </div>
+
+    `;
+  }
+
+
+  // ===================================================
+  // REPORT PAGE
+  // ===================================================
+
+  function renderReportPage() {
+
+    const summary =
+      getOverallSummary();
+
+
+    const boys =
+      getCollectionSummary("boys");
+
+    const main =
+      getCollectionSummary("main");
+
+    const family =
+      getCollectionSummary("family");
+
+
+    return `
+
+      <div class="page-header">
+
+        <div>
+
+          <h2>
+            📊 जमा-खर्च Report
+          </h2>
+
+          <p>
+            ${selectedYear} चे संपूर्ण आर्थिक सारांश
+          </p>
+
+        </div>
+
+
+        <button
+          type="button"
+          class="primary-button"
+          data-action="print-report"
+        >
+          🖨️ PDF / Print
+        </button>
+
+      </div>
+
+
+      <div class="report-sheet">
+
+        <div class="report-heading">
+
+          <div>
+
+            <h1>
+              गणपती मंडळ जमा-खर्च
+            </h1>
+
+            <p>
+              वर्ष ${selectedYear}
+            </p>
+
+          </div>
+
+          <div class="report-date">
+            Generated: ${today()}
+          </div>
+
+        </div>
+
+
+        <!-- COLLECTION -->
+
+        <div class="report-section">
+
+          <h3>
+            💰 Vargani Collection
+          </h3>
+
+
+          <table class="report-table">
+
+            <thead>
+
+              <tr>
+
+                <th>Section</th>
+
+                <th>Total</th>
+
+                <th>Paid / जमा</th>
+
+                <th>Remaining / बाकी</th>
+
+              </tr>
+
+            </thead>
+
+
+            <tbody>
+
+              ${reportRow(
+                "👦 Boys Vargani",
+                boys
+              )}
+
+              ${reportRow(
+                "⭐ Main Vargani",
+                main
+              )}
+
+              ${reportRow(
+                "👨‍👩‍👧 Family Vargani",
+                family
+              )}
+
+
+              <tr class="report-total">
+
+                <td>
+                  Total Vargani
+                </td>
+
+                <td>
+                  ${money(
+                    summary.collectionTotal
+                  )}
+                </td>
+
+                <td>
+                  ${money(
+                    summary.collectionPaid
+                  )}
+                </td>
+
+                <td>
+                  ${money(
+                    summary.collectionRemaining
+                  )}
+                </td>
+
+              </tr>
+
+            </tbody>
+
+          </table>
+
+        </div>
+
+
+        <!-- BAND -->
+
+        <div class="report-section">
+
+          <h3>
+            🎺 Band / Visarjan
+          </h3>
+
+
+          <table class="report-table">
+
+            <thead>
+
+              <tr>
+
+                <th>Section</th>
+
+                <th>Total</th>
+
+                <th>Paid / जमा</th>
+
+                <th>Remaining / बाकी</th>
+
+              </tr>
+
+            </thead>
+
+
+            <tbody>
+
+              <tr>
+
+                <td>
+                  Band / Visarjan
+                </td>
+
+                <td>
+                  ${money(
+                    summary.visarjanTotal
+                  )}
+                </td>
+
+                <td>
+                  ${money(
+                    summary.visarjanAdvance
+                  )}
+                </td>
+
+                <td>
+                  ${money(
+                    summary.visarjanRemaining
+                  )}
+                </td>
+
+              </tr>
+
+            </tbody>
+
+          </table>
+
+        </div>
+
+
+        <!-- EXPENSE -->
+
+        <div class="report-section">
+
+          <h3>
+            💸 Haat Karach / खर्च
+          </h3>
+
+
+          <table class="report-table">
+
+            <thead>
+
+              <tr>
+
+                <th>Section</th>
+
+                <th>Total</th>
+
+                <th>Paid / जमा</th>
+
+                <th>Remaining / बाकी</th>
+
+              </tr>
+
+            </thead>
+
+
+            <tbody>
+
+              <tr>
+
+                <td>
+                  Haat Karach / खर्च
+                </td>
+
+                <td>
+                  ${money(
+                    summary.expenseTotal
+                  )}
+                </td>
+
+                <td>
+                  ${money(
+                    summary.expensePaid
+                  )}
+                </td>
+
+                <td>
+                  ${money(
+                    summary.expenseRemaining
+                  )}
+                </td>
+
+              </tr>
+
+            </tbody>
+
+          </table>
+
+        </div>
+
+
+        <!-- CASH -->
+
+        <div class="report-cash">
+
+          <div>
+
+            <span>
+              हातातील रक्कम
+            </span>
+
+            <small>
+              Vargani Paid − Haat Karach Paid − Band Paid
+            </small>
+
+          </div>
+
+
+          <strong>
+            ${money(
+              summary.cashInHand
+            )}
+          </strong>
+
+        </div>
+
+
+        <div class="report-note">
+
+          <strong>
+            Note:
+          </strong>
+
+          Band Total हा Vargani Total मध्ये
+          समाविष्ट केलेला नाही. Band Paid आणि
+          Haat Karach Paid हे हातातील रक्कम
+          calculate करताना वजा केले जातात.
+
+        </div>
+
+
+        <div class="report-footer">
+
+          🙏 गणपती बाप्पा मोरया 🙏
+
+        </div>
+
+      </div>
+
+    `;
+  }
+
+
+  function reportRow(
+    name,
+    summary
+  ) {
+
+    return `
+
+      <tr>
+
+        <td>
+          ${name}
+        </td>
+
+        <td>
+          ${money(summary.total)}
+        </td>
+
+        <td>
+          ${money(summary.paid)}
+        </td>
+
+        <td>
+          ${money(summary.remaining)}
+        </td>
+
+      </tr>
+
+    `;
+  }  // ===================================================
+  // MAIN RENDER
+  // ===================================================
+
+  function render() {
+
+    let content = "";
+
+    if (currentPage === "home") {
+
+      content = renderHome();
+
+    } else if (
+      collectionTypes[currentPage]
+    ) {
+
+      content =
+        renderCollectionPage(
+          currentPage
+        );
+
+    } else if (
+      currentPage === "visarjan"
+    ) {
+
+      content =
+        renderVisarjanPage();
+
+    } else if (
+      currentPage === "expenses"
+    ) {
+
+      content =
+        renderExpensesPage();
+
+    } else if (
+      currentPage === "report"
+    ) {
+
+      content =
+        renderReportPage();
+
+    } else {
+
+      currentPage = "home";
+
+      content =
+        renderHome();
+
+    }
+
+
+    element.innerHTML =
+      layout(content);
+
+
+    attachEvents();
+
+  }
+
+
+  // ===================================================
+  // EVENT LISTENERS
+  // ===================================================
+
+  function attachEvents() {
+
+    // -----------------------------------------------
+    // NAVIGATION
+    // -----------------------------------------------
+
+    element
+      .querySelectorAll(".nav-item")
+      .forEach(button => {
+
+        button.addEventListener(
+          "click",
+          () => {
+
+            currentPage =
+              button.dataset.page;
+
+            render();
+
+          }
+        );
+
+      });
+
+
+    // -----------------------------------------------
+    // YEAR SELECTOR
+    // -----------------------------------------------
+
+    const yearSelect =
+      element.querySelector(
+        "#yearSelect"
       );
 
-    if (!button) return;
 
-    button.addEventListener(
+    if (yearSelect) {
+
+      yearSelect.addEventListener("change", async (e) => {
+  selectedYear = e.target.value;
+
+  localStorage.setItem(
+    "ganpati_selected_year",
+    selectedYear
+  );
+
+  await loadYearFromCloud();
+
+  render("home");
+});;
+
+    }
+
+
+    // -----------------------------------------------
+    // ADD COLLECTION ENTRY
+    // -----------------------------------------------
+
+    element
+      .querySelectorAll(
+        '[data-action="add-entry"]'
+      )
+      .forEach(button => {
+
+        button.addEventListener(
+          "click",
+          () => {
+
+            const type =
+              button.dataset.type;
+
+            const container =
+              element.querySelector(
+                `#${type}FormContainer`
+              );
+
+            if (container) {
+
+              container.innerHTML =
+                collectionForm(type);
+
+              attachFormEvents();
+
+              container.scrollIntoView({
+                behavior: "smooth",
+                block: "start"
+              });
+
+            }
+
+          }
+        );
+
+      });
+
+
+    // -----------------------------------------------
+    // ADD BAND
+    // -----------------------------------------------
+
+    element
+      .querySelectorAll(
+        '[data-action="add-band"]'
+      )
+      .forEach(button => {
+
+        button.addEventListener(
+          "click",
+          () => {
+
+            const container =
+              element.querySelector(
+                "#visarjanFormContainer"
+              );
+
+            if (container) {
+
+              container.innerHTML =
+                bandForm();
+
+              attachFormEvents();
+
+              container.scrollIntoView({
+                behavior: "smooth",
+                block: "start"
+              });
+
+            }
+
+          }
+        );
+
+      });
+
+
+    // -----------------------------------------------
+    // ADD EXPENSE
+    // -----------------------------------------------
+
+    element
+      .querySelectorAll(
+        '[data-action="add-expense"]'
+      )
+      .forEach(button => {
+
+        button.addEventListener(
+          "click",
+          () => {
+
+            const container =
+              element.querySelector(
+                "#expensesFormContainer"
+              );
+
+            if (container) {
+
+              container.innerHTML =
+                expenseForm();
+
+              attachFormEvents();
+
+              container.scrollIntoView({
+                behavior: "smooth",
+                block: "start"
+              });
+
+            }
+
+          }
+        );
+
+      });
+
+
+    // -----------------------------------------------
+    // EDIT COLLECTION
+    // -----------------------------------------------
+
+    element
+      .querySelectorAll(
+        '[data-action="edit-entry"]'
+      )
+      .forEach(button => {
+
+        button.addEventListener(
+          "click",
+          () => {
+
+            const type =
+              button.dataset.type;
+
+            const id =
+              button.dataset.id;
+
+            const data =
+              getData(type);
+
+            const item =
+              data.find(
+                x => String(x.id) === String(id)
+              );
+
+            if (!item) {
+              return;
+            }
+
+
+            const container =
+              element.querySelector(
+                `#${type}FormContainer`
+              );
+
+
+            if (container) {
+
+              container.innerHTML =
+                collectionForm(
+                  type,
+                  item
+                );
+
+              attachFormEvents();
+
+              container.scrollIntoView({
+                behavior: "smooth",
+                block: "start"
+              });
+
+            }
+
+          }
+        );
+
+      });
+
+
+    // -----------------------------------------------
+    // EDIT BAND
+    // -----------------------------------------------
+
+    element
+      .querySelectorAll(
+        '[data-action="edit-band"]'
+      )
+      .forEach(button => {
+
+        button.addEventListener(
+          "click",
+          () => {
+
+            const id =
+              button.dataset.id;
+
+            const data =
+              getData("visarjan");
+
+            const item =
+              data.find(
+                x => String(x.id) === String(id)
+              );
+
+            if (!item) {
+              return;
+            }
+
+
+            const container =
+              element.querySelector(
+                "#visarjanFormContainer"
+              );
+
+
+            if (container) {
+
+              container.innerHTML =
+                bandForm(item);
+
+              attachFormEvents();
+
+              container.scrollIntoView({
+                behavior: "smooth",
+                block: "start"
+              });
+
+            }
+
+          }
+        );
+
+      });
+
+
+    // -----------------------------------------------
+    // EDIT EXPENSE
+    // -----------------------------------------------
+
+    element
+      .querySelectorAll(
+        '[data-action="edit-expense"]'
+      )
+      .forEach(button => {
+
+        button.addEventListener(
+          "click",
+          () => {
+
+            const id =
+              button.dataset.id;
+
+            const data =
+              getData("expenses");
+
+            const item =
+              data.find(
+                x => String(x.id) === String(id)
+              );
+
+            if (!item) {
+              return;
+            }
+
+
+            const container =
+              element.querySelector(
+                "#expensesFormContainer"
+              );
+
+
+            if (container) {
+
+              container.innerHTML =
+                expenseForm(item);
+
+              attachFormEvents();
+
+              container.scrollIntoView({
+                behavior: "smooth",
+                block: "start"
+              });
+
+            }
+
+          }
+        );
+
+      });
+
+
+    // -----------------------------------------------
+    // DELETE COLLECTION
+    // -----------------------------------------------
+
+    element
+      .querySelectorAll(
+        '[data-action="delete-entry"]'
+      )
+      .forEach(button => {
+
+        button.addEventListener(
+          "click",
+          () => {
+
+            const type =
+              button.dataset.type;
+
+            const id =
+              button.dataset.id;
+
+
+            if (
+              !confirm(
+                "ही नोंद delete करायची आहे का?"
+              )
+            ) {
+
+              return;
+
+            }
+
+
+            const data =
+              getData(type);
+
+
+            const updated =
+              data.filter(
+                item =>
+                  String(item.id) !==
+                  String(id)
+              );
+
+
+            saveData(
+              type,
+              updated
+            );
+
+
+            render();
+
+          }
+        );
+
+      });
+
+
+    // -----------------------------------------------
+    // DELETE BAND
+    // -----------------------------------------------
+
+    element
+      .querySelectorAll(
+        '[data-action="delete-band"]'
+      )
+      .forEach(button => {
+
+        button.addEventListener(
+          "click",
+          () => {
+
+            const id =
+              button.dataset.id;
+
+
+            if (
+              !confirm(
+                "हा Band record delete करायचा आहे का?"
+              )
+            ) {
+
+              return;
+
+            }
+
+
+            const data =
+              getData("visarjan");
+
+
+            const updated =
+              data.filter(
+                item =>
+                  String(item.id) !==
+                  String(id)
+              );
+
+
+            saveData(
+              "visarjan",
+              updated
+            );
+
+
+            render();
+
+          }
+        );
+
+      });
+
+
+    // -----------------------------------------------
+    // DELETE EXPENSE
+    // -----------------------------------------------
+
+    element
+      .querySelectorAll(
+        '[data-action="delete-expense"]'
+      )
+      .forEach(button => {
+
+        button.addEventListener(
+          "click",
+          () => {
+
+            const id =
+              button.dataset.id;
+
+
+            if (
+              !confirm(
+                "हा expense delete करायचा आहे का?"
+              )
+            ) {
+
+              return;
+
+            }
+
+
+            const data =
+              getData("expenses");
+
+
+            const updated =
+              data.filter(
+                item =>
+                  String(item.id) !==
+                  String(id)
+              );
+
+
+            saveData(
+              "expenses",
+              updated
+            );
+
+
+            render();
+
+          }
+        );
+
+      });
+
+
+    // -----------------------------------------------
+    // PRINT REPORT
+    // -----------------------------------------------
+
+    element
+      .querySelectorAll(
+        '[data-action="print-report"]'
+      )
+      .forEach(button => {
+
+        button.addEventListener(
+          "click",
+          () => {
+
+            window.print();
+
+          }
+        );
+
+      });
+
+
+    // -----------------------------------------------
+    // FORM CLOSE BUTTONS
+    // -----------------------------------------------
+
+    element
+      .querySelectorAll(
+        '[data-action="close-form"]'
+      )
+      .forEach(button => {
+
+        button.addEventListener(
+          "click",
+          () => {
+
+            const type =
+              button.dataset.type;
+
+            const container =
+              element.querySelector(
+                `#${type}FormContainer`
+              );
+
+            if (container) {
+
+              container.innerHTML = "";
+
+            }
+
+          }
+        );
+
+      });
+
+
+    element
+      .querySelectorAll(
+        '[data-action="close-band-form"]'
+      )
+      .forEach(button => {
+
+        button.addEventListener(
+          "click",
+          () => {
+
+            const container =
+              element.querySelector(
+                "#visarjanFormContainer"
+              );
+
+            if (container) {
+
+              container.innerHTML = "";
+
+            }
+
+          }
+        );
+
+      });
+
+
+    element
+      .querySelectorAll(
+        '[data-action="close-expense-form"]'
+      )
+      .forEach(button => {
+
+        button.addEventListener(
+          "click",
+          () => {
+
+            const container =
+              element.querySelector(
+                "#expensesFormContainer"
+              );
+
+            if (container) {
+
+              container.innerHTML = "";
+
+            }
+
+          }
+        );
+
+      });
+
+  }
+
+
+  // ===================================================
+  // FORM EVENTS
+  // ===================================================
+
+  function attachFormEvents() {
+
+    // -----------------------------------------------
+    // COLLECTION FORMS
+    // -----------------------------------------------
+
+    element
+      .querySelectorAll(
+        ".entry-form[data-type]"
+      )
+      .forEach(form => {
+
+        const type =
+          form.dataset.type;
+
+
+        const totalInput =
+          form.querySelector(
+            '[name="total"]'
+          );
+
+
+        const paidInput =
+          form.querySelector(
+            '[name="paid"]'
+          );
+
+
+        const remainingInput =
+          form.querySelector(
+            '[name="remaining"]'
+          );
+
+
+        function updateRemaining() {
+
+          const total =
+            num(totalInput?.value);
+
+          const paid =
+            num(paidInput?.value);
+
+          if (remainingInput) {
+
+            remainingInput.value =
+              Math.max(
+                total - paid,
+                0
+              );
+
+          }
+
+        }
+
+
+        totalInput?.addEventListener(
+          "input",
+          updateRemaining
+        );
+
+
+        paidInput?.addEventListener(
+          "input",
+          updateRemaining
+        );
+
+
+        form.addEventListener(
+          "submit",
+          event => {
+
+            event.preventDefault();
+
+            updateRemaining();
+
+
+            const formData =
+              new FormData(form);
+
+
+            const name =
+              String(
+                formData.get("name") || ""
+              ).trim();
+
+
+            const mobile =
+              String(
+                formData.get("mobile") || ""
+              ).trim();
+
+
+            const total =
+              num(
+                formData.get("total")
+              );
+
+
+            const paid =
+              num(
+                formData.get("paid")
+              );
+
+
+            const remarks =
+              String(
+                formData.get("remarks") || ""
+              ).trim();
+
+
+            if (!name) {
+
+              alert(
+                "Please enter name."
+              );
+
+              return;
+
+            }
+
+
+            if (paid > total) {
+
+              alert(
+                "Paid amount Total पेक्षा जास्त असू शकत नाही."
+              );
+
+              return;
+
+            }
+
+
+            const data =
+              getData(type);
+
+
+            const editId =
+              form.dataset.editId;
+
+
+            if (editId) {
+
+              const index =
+                data.findIndex(
+                  item =>
+                    String(item.id) ===
+                    String(editId)
+                );
+
+
+              if (index !== -1) {
+
+                data[index] = {
+                  ...data[index],
+
+                  name,
+                  mobile,
+                  total,
+                  paid,
+                  remaining:
+                    total - paid,
+                  remarks,
+
+                  updatedAt:
+                    new Date().toISOString()
+                };
+
+              }
+
+            } else {
+
+              data.push({
+
+                id:
+                  Date.now().toString(),
+
+                name,
+                mobile,
+                total,
+                paid,
+
+                remaining:
+                  total - paid,
+
+                remarks,
+
+                createdAt:
+                  new Date().toISOString(),
+
+                updatedAt:
+                  new Date().toISOString()
+
+              });
+
+            }
+
+
+            saveData(
+              type,
+              data
+            );
+
+
+            render();
+
+          }
+        );
+
+      });
+
+
+    // -----------------------------------------------
+    // BAND FORM
+    // -----------------------------------------------
+
+    const bandFormElement =
+      element.querySelector(
+        "#bandEntryForm"
+      );
+
+
+    if (bandFormElement) {
+
+      const totalInput =
+        bandFormElement.querySelector(
+          '[name="total"]'
+        );
+
+
+      const paidInput =
+        bandFormElement.querySelector(
+          '[name="paid"]'
+        );
+
+
+      const remainingInput =
+        bandFormElement.querySelector(
+          '[name="remaining"]'
+        );
+
+
+      function updateBandRemaining() {
+
+        const total =
+          num(totalInput?.value);
+
+        const paid =
+          num(paidInput?.value);
+
+
+        if (remainingInput) {
+
+          remainingInput.value =
+            Math.max(
+              total - paid,
+              0
+            );
+
+        }
+
+      }
+
+
+      totalInput?.addEventListener(
+        "input",
+        updateBandRemaining
+      );
+
+
+      paidInput?.addEventListener(
+        "input",
+        updateBandRemaining
+      );
+
+
+      bandFormElement.addEventListener(
+        "submit",
+        event => {
+
+          event.preventDefault();
+
+          updateBandRemaining();
+
+
+          const formData =
+            new FormData(
+              bandFormElement
+            );
+
+
+          const bandName =
+            String(
+              formData.get("bandName") || ""
+            ).trim();
+
+
+          const total =
+            num(
+              formData.get("total")
+            );
+
+
+          const paid =
+            num(
+              formData.get("paid")
+            );
+
+
+          const remarks =
+            String(
+              formData.get("remarks") || ""
+            ).trim();
+
+
+          if (!bandName) {
+
+            alert(
+              "Please enter Band Name."
+            );
+
+            return;
+
+          }
+
+
+          if (paid > total) {
+
+            alert(
+              "Paid amount Total पेक्षा जास्त असू शकत नाही."
+            );
+
+            return;
+
+          }
+
+
+          const data =
+            getData("visarjan");
+
+
+          const editId =
+            bandFormElement.dataset.editId;
+
+
+          if (editId) {
+
+            const index =
+              data.findIndex(
+                item =>
+                  String(item.id) ===
+                  String(editId)
+              );
+
+
+            if (index !== -1) {
+
+              data[index] = {
+                ...data[index],
+
+                bandName,
+                total,
+                paid,
+
+                // Keep remaining calculated.
+                remaining:
+                  total - paid,
+
+                remarks,
+
+                updatedAt:
+                  new Date().toISOString()
+              };
+
+            }
+
+          } else {
+
+            data.push({
+
+              id:
+                Date.now().toString(),
+
+              bandName,
+
+              total,
+              paid,
+
+              remaining:
+                total - paid,
+
+              remarks,
+
+              createdAt:
+                new Date().toISOString(),
+
+              updatedAt:
+                new Date().toISOString()
+
+            });
+
+          }
+
+
+          saveData(
+            "visarjan",
+            data
+          );
+
+
+          render();
+
+        }
+      );
+
+    }
+
+
+    // -----------------------------------------------
+    // EXPENSE FORM
+    // -----------------------------------------------
+
+    const expenseFormElement =
+      element.querySelector(
+        "#expenseEntryForm"
+      );
+
+
+    if (expenseFormElement) {
+
+      const totalInput =
+        expenseFormElement.querySelector(
+          '[name="total"]'
+        );
+
+
+      const paidInput =
+        expenseFormElement.querySelector(
+          '[name="paid"]'
+        );
+
+
+      const remainingInput =
+        expenseFormElement.querySelector(
+          '[name="remaining"]'
+        );
+
+
+      function updateExpenseRemaining() {
+
+        const total =
+          num(totalInput?.value);
+
+        const paid =
+          num(paidInput?.value);
+
+
+        if (remainingInput) {
+
+          remainingInput.value =
+            Math.max(
+              total - paid,
+              0
+            );
+
+        }
+
+      }
+
+
+      totalInput?.addEventListener(
+        "input",
+        updateExpenseRemaining
+      );
+
+
+      paidInput?.addEventListener(
+        "input",
+        updateExpenseRemaining
+      );
+
+
+      expenseFormElement.addEventListener(
+        "submit",
+        event => {
+
+          event.preventDefault();
+
+          updateExpenseRemaining();
+
+
+          const formData =
+            new FormData(
+              expenseFormElement
+            );
+
+
+          const title =
+            String(
+              formData.get("title") || ""
+            ).trim();
+
+
+          const total =
+            num(
+              formData.get("total")
+            );
+
+
+          const paid =
+            num(
+              formData.get("paid")
+            );
+
+
+          const remarks =
+            String(
+              formData.get("remarks") || ""
+            ).trim();
+
+
+          if (!title) {
+
+            alert(
+              "Please enter Expense Name."
+            );
+
+            return;
+
+          }
+
+
+          if (paid > total) {
+
+            alert(
+              "Paid amount Total पेक्षा जास्त असू शकत नाही."
+            );
+
+            return;
+
+          }
+
+
+          const data =
+            getData("expenses");
+
+
+          const editId =
+            expenseFormElement.dataset.editId;
+
+
+          if (editId) {
+
+            const index =
+              data.findIndex(
+                item =>
+                  String(item.id) ===
+                  String(editId)
+              );
+
+
+            if (index !== -1) {
+
+              data[index] = {
+                ...data[index],
+
+                title,
+                total,
+                paid,
+
+                remaining:
+                  total - paid,
+
+                remarks,
+
+                updatedAt:
+                  new Date().toISOString()
+              };
+
+            }
+
+          } else {
+
+            data.push({
+
+              id:
+                Date.now().toString(),
+
+              title,
+
+              total,
+              paid,
+
+              remaining:
+                total - paid,
+
+              remarks,
+
+              createdAt:
+                new Date().toISOString(),
+
+              updatedAt:
+                new Date().toISOString()
+
+            });
+
+          }
+
+
+          saveData(
+            "expenses",
+            data
+          );
+
+
+          render();
+
+        }
+      );
+
+    }
+
+  }
+
+
+  // ===================================================
+  // INITIAL RENDER
+  // ===================================================
+
+  render();
+
+}// =====================================================
+// SUPABASE AUTHENTICATION
+// =====================================================
+
+async function showLoginScreen(element) {
+
+  element.innerHTML = `
+
+    <div class="auth-page">
+
+      <div class="auth-card">
+
+        <div class="auth-logo">
+          🪔
+        </div>
+
+        <h1>
+          Ganpati Accounts
+        </h1>
+
+        <p class="auth-subtitle">
+          Secure Mandal Accounts
+        </p>
+
+
+        <div id="authMessage"></div>
+
+
+        <form id="loginForm">
+
+          <div class="auth-field">
+
+            <label>
+              Login ID / Email
+            </label>
+
+            <input
+              id="loginEmail"
+              type="email"
+              placeholder="Enter your email"
+              autocomplete="email"
+              required
+            />
+
+          </div>
+
+
+          <div class="auth-field">
+
+            <label>
+              Password
+            </label>
+
+            <input
+              id="loginPassword"
+              type="password"
+              placeholder="Enter password"
+              autocomplete="current-password"
+              required
+            />
+
+          </div>
+
+
+          <button
+            type="submit"
+            class="auth-primary-button"
+            id="loginButton"
+          >
+            Login
+          </button>
+
+        </form>
+
+
+        <div class="auth-links">
+
+          <button
+            type="button"
+            id="showSignupButton"
+          >
+            Create Account
+          </button>
+
+
+          <button
+            type="button"
+            id="showForgotButton"
+          >
+            Forgot Password?
+          </button>
+
+        </div>
+
+
+        <div class="auth-footer">
+
+          🔐 Your accounts data is protected.
+
+        </div>
+
+      </div>
+
+    </div>
+
+  `;
+
+
+  attachLoginEvents(element);
+
+}
+
+
+// =====================================================
+// LOGIN EVENTS
+// =====================================================
+
+function attachLoginEvents(element) {
+
+  const loginForm =
+    element.querySelector("#loginForm");
+
+
+  const message =
+    element.querySelector("#authMessage");
+
+
+  function showMessage(
+    text,
+    type = "error"
+  ) {
+
+    if (!message) {
+      return;
+    }
+
+
+    message.innerHTML = `
+
+      <div class="auth-message ${type}">
+        ${escapeAuthHTML(text)}
+      </div>
+
+    `;
+
+  }
+
+
+  loginForm?.addEventListener(
+    "submit",
+    async event => {
+
+      event.preventDefault();
+
+
+      const email =
+        element
+          .querySelector("#loginEmail")
+          ?.value
+          .trim();
+
+
+      const password =
+        element
+          .querySelector("#loginPassword")
+          ?.value;
+
+
+      const loginButton =
+        element.querySelector(
+          "#loginButton"
+        );
+
+
+      if (!email || !password) {
+
+        showMessage(
+          "Email आणि Password दोन्ही भरा."
+        );
+
+        return;
+
+      }
+
+
+      if (!supabaseConfigured) {
+
+        showMessage(
+          "Supabase configuration missing. Please check src/supabase.js."
+        );
+
+        return;
+
+      }
+
+
+      if (loginButton) {
+
+        loginButton.disabled = true;
+        loginButton.textContent =
+          "Logging in...";
+
+      }
+
+
+      const {
+        error
+      } =
+        await supabase.auth.signInWithPassword({
+          email,
+          password
+        });
+
+
+      if (error) {
+
+        showMessage(
+          error.message ||
+          "Login failed. Please check your email and password."
+        );
+
+
+        if (loginButton) {
+
+          loginButton.disabled = false;
+          loginButton.textContent =
+            "Login";
+
+        }
+
+
+        return;
+
+      }
+
+
+      // Auth state listener will start the application.
+
+    }
+  );
+
+
+  element
+    .querySelector(
+      "#showSignupButton"
+    )
+    ?.addEventListener(
       "click",
       () => {
 
-        window.print();
+        showSignupScreen(element);
 
       }
     );
+
+
+  element
+    .querySelector(
+      "#showForgotButton"
+    )
+    ?.addEventListener(
+      "click",
+      () => {
+
+        showForgotPasswordScreen(
+          element
+        );
+
+      }
+    );
+
+}
+
+
+// =====================================================
+// SIGN UP SCREEN
+// =====================================================
+
+function showSignupScreen(element) {
+
+  element.innerHTML = `
+
+    <div class="auth-page">
+
+      <div class="auth-card">
+
+        <div class="auth-logo">
+          🪔
+        </div>
+
+        <h1>
+          Create Account
+        </h1>
+
+        <p class="auth-subtitle">
+          Ganpati Accounts
+        </p>
+
+
+        <div id="authMessage"></div>
+
+
+        <form id="signupForm">
+
+          <div class="auth-field">
+
+            <label>
+              Email
+            </label>
+
+            <input
+              id="signupEmail"
+              type="email"
+              placeholder="Enter email"
+              autocomplete="email"
+              required
+            />
+
+          </div>
+
+
+          <div class="auth-field">
+
+            <label>
+              Password
+            </label>
+
+            <input
+              id="signupPassword"
+              type="password"
+              placeholder="Minimum 6 characters"
+              autocomplete="new-password"
+              minlength="6"
+              required
+            />
+
+          </div>
+
+
+          <div class="auth-field">
+
+            <label>
+              Confirm Password
+            </label>
+
+            <input
+              id="signupConfirmPassword"
+              type="password"
+              placeholder="Confirm password"
+              autocomplete="new-password"
+              minlength="6"
+              required
+            />
+
+          </div>
+
+
+          <button
+            type="submit"
+            class="auth-primary-button"
+            id="signupButton"
+          >
+            Create Account
+          </button>
+
+        </form>
+
+
+        <div class="auth-links">
+
+          <button
+            type="button"
+            id="backToLoginButton"
+          >
+            ← Back to Login
+          </button>
+
+        </div>
+
+
+      </div>
+
+    </div>
+
+  `;
+
+
+  const form =
+    element.querySelector(
+      "#signupForm"
+    );
+
+
+  const message =
+    element.querySelector(
+      "#authMessage"
+    );
+
+
+  function showMessage(
+    text,
+    type = "error"
+  ) {
+
+    if (!message) {
+      return;
+    }
+
+
+    message.innerHTML = `
+
+      <div class="auth-message ${type}">
+        ${escapeAuthHTML(text)}
+      </div>
+
+    `;
+
   }
 
-  // ===================================================
-  // START APP
-  // ===================================================
 
-  render("home");
+  form?.addEventListener(
+    "submit",
+    async event => {
+
+      event.preventDefault();
+
+
+      const email =
+        element
+          .querySelector(
+            "#signupEmail"
+          )
+          ?.value
+          .trim();
+
+
+      const password =
+        element
+          .querySelector(
+            "#signupPassword"
+          )
+          ?.value;
+
+
+      const confirmPassword =
+        element
+          .querySelector(
+            "#signupConfirmPassword"
+          )
+          ?.value;
+
+
+      const signupButton =
+        element.querySelector(
+          "#signupButton"
+        );
+
+
+      if (
+        password !==
+        confirmPassword
+      ) {
+
+        showMessage(
+          "Passwords match होत नाहीत."
+        );
+
+        return;
+
+      }
+
+
+      if (password.length < 6) {
+
+        showMessage(
+          "Password किमान 6 characters चा असावा."
+        );
+
+        return;
+
+      }
+
+
+      if (!supabaseConfigured) {
+
+        showMessage(
+          "Supabase configuration missing."
+        );
+
+        return;
+
+      }
+
+
+      if (signupButton) {
+
+        signupButton.disabled = true;
+        signupButton.textContent =
+          "Creating...";
+
+      }
+
+
+      const {
+        data,
+        error
+      } =
+        await supabase.auth.signUp({
+          email,
+          password
+        });
+
+
+      if (error) {
+
+        showMessage(
+          error.message ||
+          "Account create failed."
+        );
+
+
+        if (signupButton) {
+
+          signupButton.disabled = false;
+          signupButton.textContent =
+            "Create Account";
+
+        }
+
+
+        return;
+
+      }
+
+
+      if (data?.session) {
+
+        // Session available immediately.
+        // Auth state listener will handle app startup.
+
+        showMessage(
+          "Account created successfully!",
+          "success"
+        );
+
+      } else {
+
+        showMessage(
+          "Account created. Please check your email for verification.",
+          "success"
+        );
+
+
+        if (signupButton) {
+
+          signupButton.disabled = false;
+          signupButton.textContent =
+            "Create Account";
+
+        }
+
+      }
+
+    }
+  );
+
+
+  element
+    .querySelector(
+      "#backToLoginButton"
+    )
+    ?.addEventListener(
+      "click",
+      () => {
+
+        showLoginScreen(element);
+
+      }
+    );
+
+}
+
+
+// =====================================================
+// FORGOT PASSWORD
+// =====================================================
+
+function showForgotPasswordScreen(
+  element
+) {
+
+  element.innerHTML = `
+
+    <div class="auth-page">
+
+      <div class="auth-card">
+
+        <div class="auth-logo">
+          🔐
+        </div>
+
+        <h1>
+          Forgot Password?
+        </h1>
+
+        <p class="auth-subtitle">
+          Reset your Ganpati Accounts password
+        </p>
+
+
+        <div id="authMessage"></div>
+
+
+        <form id="forgotPasswordForm">
+
+          <div class="auth-field">
+
+            <label>
+              Email
+            </label>
+
+            <input
+              id="forgotEmail"
+              type="email"
+              placeholder="Enter registered email"
+              autocomplete="email"
+              required
+            />
+
+          </div>
+
+
+          <button
+            type="submit"
+            class="auth-primary-button"
+            id="forgotButton"
+          >
+            Send Reset Link
+          </button>
+
+        </form>
+
+
+        <div class="auth-links">
+
+          <button
+            type="button"
+            id="backToLoginButton"
+          >
+            ← Back to Login
+          </button>
+
+        </div>
+
+      </div>
+
+    </div>
+
+  `;
+
+
+  const form =
+    element.querySelector(
+      "#forgotPasswordForm"
+    );
+
+
+  const message =
+    element.querySelector(
+      "#authMessage"
+    );
+
+
+  function showMessage(
+    text,
+    type = "error"
+  ) {
+
+    if (!message) {
+      return;
+    }
+
+
+    message.innerHTML = `
+
+      <div class="auth-message ${type}">
+        ${escapeAuthHTML(text)}
+      </div>
+
+    `;
+
+  }
+
+
+  form?.addEventListener(
+    "submit",
+    async event => {
+
+      event.preventDefault();
+
+
+      const email =
+        element
+          .querySelector(
+            "#forgotEmail"
+          )
+          ?.value
+          .trim();
+
+
+      const button =
+        element.querySelector(
+          "#forgotButton"
+        );
+
+
+      if (!supabaseConfigured) {
+
+        showMessage(
+          "Supabase configuration missing."
+        );
+
+        return;
+
+      }
+
+
+      if (button) {
+
+        button.disabled = true;
+        button.textContent =
+          "Sending...";
+
+      }
+
+
+      const redirectTo =
+        window.location.origin +
+        window.location.pathname;
+
+
+      const {
+        error
+      } =
+        await supabase.auth.resetPasswordForEmail(
+          email,
+          {
+            redirectTo
+          }
+        );
+
+
+      if (error) {
+
+        showMessage(
+          error.message ||
+          "Unable to send reset link."
+        );
+
+
+        if (button) {
+
+          button.disabled = false;
+          button.textContent =
+            "Send Reset Link";
+
+        }
+
+
+        return;
+
+      }
+
+
+      showMessage(
+        "Password reset link email वर पाठवला आहे.",
+        "success"
+      );
+
+
+      if (button) {
+
+        button.disabled = false;
+        button.textContent =
+          "Send Reset Link";
+
+      }
+
+    }
+  );
+
+
+  element
+    .querySelector(
+      "#backToLoginButton"
+    )
+    ?.addEventListener(
+      "click",
+      () => {
+
+        showLoginScreen(element);
+
+      }
+    );
+
+}
+
+
+// =====================================================
+// PASSWORD UPDATE SCREEN
+// =====================================================
+
+function showUpdatePasswordScreen(
+  element
+) {
+
+  element.innerHTML = `
+
+    <div class="auth-page">
+
+      <div class="auth-card">
+
+        <div class="auth-logo">
+          🔐
+        </div>
+
+        <h1>
+          Set New Password
+        </h1>
+
+        <p class="auth-subtitle">
+          Enter your new password
+        </p>
+
+
+        <div id="authMessage"></div>
+
+
+        <form id="updatePasswordForm">
+
+          <div class="auth-field">
+
+            <label>
+              New Password
+            </label>
+
+            <input
+              id="newPassword"
+              type="password"
+              placeholder="Minimum 6 characters"
+              autocomplete="new-password"
+              minlength="6"
+              required
+            />
+
+          </div>
+
+
+          <div class="auth-field">
+
+            <label>
+              Confirm Password
+            </label>
+
+            <input
+              id="confirmNewPassword"
+              type="password"
+              placeholder="Confirm password"
+              autocomplete="new-password"
+              minlength="6"
+              required
+            />
+
+          </div>
+
+
+          <button
+            type="submit"
+            class="auth-primary-button"
+            id="updatePasswordButton"
+          >
+            Update Password
+          </button>
+
+        </form>
+
+      </div>
+
+    </div>
+
+  `;
+
+
+  const form =
+    element.querySelector(
+      "#updatePasswordForm"
+    );
+
+
+  const message =
+    element.querySelector(
+      "#authMessage"
+    );
+
+
+  function showMessage(
+    text,
+    type = "error"
+  ) {
+
+    if (!message) {
+      return;
+    }
+
+
+    message.innerHTML = `
+
+      <div class="auth-message ${type}">
+        ${escapeAuthHTML(text)}
+      </div>
+
+    `;
+
+  }
+
+
+  form?.addEventListener(
+    "submit",
+    async event => {
+
+      event.preventDefault();
+
+
+      const password =
+        element
+          .querySelector(
+            "#newPassword"
+          )
+          ?.value;
+
+
+      const confirmPassword =
+        element
+          .querySelector(
+            "#confirmNewPassword"
+          )
+          ?.value;
+
+
+      const button =
+        element.querySelector(
+          "#updatePasswordButton"
+        );
+
+
+      if (
+        password !==
+        confirmPassword
+      ) {
+
+        showMessage(
+          "Passwords match होत नाहीत."
+        );
+
+        return;
+
+      }
+
+
+      if (password.length < 6) {
+
+        showMessage(
+          "Password किमान 6 characters चा असावा."
+        );
+
+        return;
+
+      }
+
+
+      if (button) {
+
+        button.disabled = true;
+        button.textContent =
+          "Updating...";
+
+      }
+
+
+      const {
+        error
+      } =
+        await supabase.auth.updateUser({
+          password
+        });
+
+
+      if (error) {
+
+        showMessage(
+          error.message ||
+          "Password update failed."
+        );
+
+
+        if (button) {
+
+          button.disabled = false;
+          button.textContent =
+            "Update Password";
+
+        }
+
+
+        return;
+
+      }
+
+
+      showMessage(
+        "Password successfully updated. Please login again.",
+        "success"
+      );
+
+
+      await supabase.auth.signOut();
+
+
+      setTimeout(
+        () => {
+
+          showLoginScreen(
+            element
+          );
+
+        },
+        1200
+      );
+
+    }
+  );
+
+}
+
+
+// =====================================================
+// AUTH HTML ESCAPE
+// =====================================================
+
+function escapeAuthHTML(
+  value
+) {
+
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+
+}
+
+
+// =====================================================
+// START APPLICATION AFTER LOGIN
+// =====================================================
+
+async function bootAuthenticatedApp(
+  element
+) {
+
+  try {
+
+    await startApp(element);
+
+  } catch (error) {
+
+    console.error(
+      "Application startup error:",
+      error
+    );
+
+
+    element.innerHTML = `
+
+      <div
+        style="
+          padding:40px;
+          font-family:Arial,sans-serif;
+          text-align:center;
+        "
+      >
+
+        <h2>
+          Something went wrong
+        </h2>
+
+        <p>
+          ${escapeAuthHTML(
+            error?.message ||
+            "Unknown application error"
+          )}
+        </p>
+
+      </div>
+
+    `;
+
+  }
+
+}
+
+
+// =====================================================
+// AUTH BOOT
+// =====================================================
+
+export async function setupApp(
+  element
+) {
+
+  if (!element) {
+
+    console.error(
+      "App element not found."
+    );
+
+    return;
+
+  }
+
+
+  // ---------------------------------------------------
+  // Supabase must be configured
+  // ---------------------------------------------------
+
+  if (!supabaseConfigured) {
+
+    element.innerHTML = `
+
+      <div
+        style="
+          min-height:100vh;
+          display:flex;
+          align-items:center;
+          justify-content:center;
+          padding:30px;
+          font-family:Arial,sans-serif;
+          background:#f7efe3;
+        "
+      >
+
+        <div
+          style="
+            max-width:520px;
+            width:100%;
+            background:#fff;
+            padding:32px;
+            border-radius:20px;
+            box-shadow:0 12px 40px rgba(0,0,0,.12);
+          "
+        >
+
+          <h2>
+            Supabase Configuration Required
+          </h2>
+
+          <p>
+            Please check your
+            <strong>
+              src/supabase.js
+            </strong>
+            file.
+          </p>
+
+          <p>
+            SUPABASE_URL आणि publishable key
+            properly configured आहेत का ते तपासा.
+          </p>
+
+        </div>
+
+      </div>
+
+    `;
+
+    return;
+
+  }
+
+
+  // ---------------------------------------------------
+  // Check current session
+  // ---------------------------------------------------
+
+  const {
+    data,
+    error
+  } =
+    await supabase.auth.getSession();
+
+
+  if (error) {
+
+    console.error(
+      "Session error:",
+      error
+    );
+
+
+    await showLoginScreen(
+      element
+    );
+
+    return;
+
+  }
+
+
+  // ---------------------------------------------------
+  // Existing session
+  // ---------------------------------------------------
+
+  if (data?.session) {
+
+    await bootAuthenticatedApp(
+      element
+    );
+
+  } else {
+
+    await showLoginScreen(
+      element
+    );
+
+  }
+
+
+  // ---------------------------------------------------
+  // Auth state listener
+  // ---------------------------------------------------
+
+  supabase.auth.onAuthStateChange(
+    async (
+      event,
+      session
+    ) => {
+
+      console.log(
+        "Auth event:",
+        event
+      );
+
+
+      if (
+        event ===
+        "SIGNED_IN"
+      ) {
+
+        if (session) {
+
+          await bootAuthenticatedApp(
+            element
+          );
+
+        }
+
+      }
+
+
+      if (
+        event ===
+        "SIGNED_OUT"
+      ) {
+
+        await showLoginScreen(
+          element
+        );
+
+      }
+
+
+      if (
+        event ===
+        "PASSWORD_RECOVERY"
+      ) {
+
+        showUpdatePasswordScreen(
+          element
+        );
+
+      }
+
+    }
+  );
+
 }
