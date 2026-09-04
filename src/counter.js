@@ -2948,7 +2948,70 @@ function saveData(type, data) {
   // EVENT LISTENERS
   // ===================================================
 
-  function attachEvents() {
+  function attachEvents() {function attachEvents(element) {
+
+  // -----------------------------------------------
+  // LOGOUT
+  // -----------------------------------------------
+
+  const logoutBtn =
+    element.querySelector("#logoutBtn");
+
+  if (logoutBtn) {
+    logoutBtn.addEventListener(
+      "click",
+      async () => {
+        const originalText =
+          logoutBtn.textContent;
+
+        try {
+          logoutBtn.disabled = true;
+          logoutBtn.textContent =
+            "Logging out...";
+
+          const { error } =
+            await supabase.auth.signOut();
+
+          if (error) {
+            console.error(
+              "Logout error:",
+              error
+            );
+
+            alert(
+              error.message ||
+              "Logout failed. Please try again."
+            );
+
+            logoutBtn.disabled = false;
+            logoutBtn.textContent =
+              originalText;
+
+            return;
+          }
+
+          // SIGNED_OUT auth listener
+          // automatically opens Login screen.
+        } catch (error) {
+          console.error(
+            "Logout error:",
+            error
+          );
+
+          alert(
+            error?.message ||
+            "Logout failed. Please try again."
+          );
+
+          logoutBtn.disabled = false;
+          logoutBtn.textContent =
+            originalText;
+        }
+      }
+    );
+  }
+
+  // इथून तुझा existing code सुरू राहू दे
 
     // -----------------------------------------------
     // NAVIGATION
